@@ -9,8 +9,8 @@ ai_image_analyzer
 - .env конфиг (OPENAI_*, IMAGE_*, PROMPT_FILE, COLLAGE_*).
 - Переопределение этих параметров через CLI.
 - Режимы:
-  * одна картинка → один запрос, результат в *_analyse.txt;
-  * несколько картинок (до 10) → коллаж, один запрос, group_..._analyse.txt;
+  * одна картинка → один запрос, результат в *_analyse.md;
+  * несколько картинок (до 10) → коллаж, один запрос, group_..._analyse.md;
   * override-текст (-t/--text) вместо системного промта → печать только в stdout;
   * текст без картинок → текстовый запрос к модели, результат в stdout.
 - Логи и статистика по usage (токены, стоимость).
@@ -435,7 +435,7 @@ def call_model_with_text_only(
 
 def save_result_for_single_image(image_path: str, text: str) -> str:
     base, _ext = os.path.splitext(image_path)
-    out_path = f"{base}_analyse.txt"
+    out_path = f"{base}_analyse.md"
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(text)
     return out_path
@@ -448,7 +448,7 @@ def save_result_for_group(image_paths: List[str], text: str) -> str:
     """
     folder = os.path.dirname(image_paths[0]) if image_paths else "."
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(folder, f"group_{ts}_analyse.txt")
+    out_path = os.path.join(folder, f"group_{ts}_analyse.md")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(text)
     return out_path
