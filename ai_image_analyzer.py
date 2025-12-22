@@ -66,6 +66,8 @@ class Config:
     collage_max_size: int
     collage_quality: int
     prompt_file: Optional[str]
+    billing_url: Optional[str]
+    balance_threshold: Optional[float]
 
 
 def load_config() -> Config:
@@ -88,6 +90,15 @@ def load_config() -> Config:
         except ValueError:
             sys.exit(f"ERROR: {name} must be an integer, got {val!r}")
 
+    def _float_env(name: str, default: Optional[float] = None) -> Optional[float]:
+        val = os.environ.get(name)
+        if not val:
+            return default
+        try:
+            return float(val)
+        except ValueError:
+            sys.exit(f"ERROR: {name} must be a float, got {val!r}")
+
     timeout = _int_env("OPENAI_TIMEOUT", 60)
     max_tokens = _int_env("OPENAI_MAX_TOKENS", 1024)
     image_max_size = _int_env("IMAGE_MAX_SIZE", 1024)
@@ -98,6 +109,8 @@ def load_config() -> Config:
 
     prompt_file = os.environ.get("PROMPT_FILE")
     base_url = os.environ.get("OPENAI_BASE_URL") or None
+    billing_url = os.environ.get("BILLING_URL") or None
+    balance_threshold = _float_env("OPENAI_BALANCE_THRESHOLD")
 
     return Config(
         api_key=api_key,
@@ -110,6 +123,8 @@ def load_config() -> Config:
         collage_max_size=collage_max_size,
         collage_quality=collage_quality,
         prompt_file=prompt_file,
+        billing_url=billing_url,
+        balance_threshold=balance_threshold,
     )
 
 
@@ -267,6 +282,32 @@ def build_client(cfg: Config) -> "OpenAI":
     if cfg.base_url:
         kwargs["base_url"] = cfg.base_url
     return OpenAI(**kwargs)  # type: ignore[arg-type]
+
+
+def get_balance(cfg: Config) -> Optional[dict]:
+    if not cfg.billing_url:
+        return None
+    try:
+        import requests
+    except ImportError:
+        log("requests not installed, cannot check balance", False)
+        return None
+    headers = {"Authorization": f"Bearer {cfg.api_key}"}
+    try:
+        resp = requests.get(cfg.billing_url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                return data
+            except Exception as e:
+                log(f"Failed to parse balance JSON: {e} {resp.text[:200]}", False)
+                return None
+        else:
+            log(f"Balance request failed: {resp.status_code} {resp.text[:200]}", False)
+            return None
+    except Exception as e:
+        log(f"Balance request error: {e}", False)
+        return None
 
 
 def call_model_with_image(
@@ -453,6 +494,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Override PROMPT_FILE from .env",
     )
     parser.add_argument(
+        "--check-balance",
+        action="store_true",
+        help="Check account balance via BILLING_URL and warn if below OPENAI_BALANCE_THRESHOLD.",
+    )
+    parser.add_argument(
         "--per-image",
         action="store_true",
         help="Analyze each image in a separate request (no collage, no group file).",
@@ -488,6 +534,31 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             os.environ[name] = str(val)
 
     cfg = load_config()
+
+    # Check balance if requested
+    if args.check_balance:
+        balance_data = get_balance(cfg)
+        if balance_data:
+            print("Balance Information:")
+            print(f"  Status: {balance_data.get('status', 'unknown')}")
+            data = balance_data.get('data', {})
+            if 'credits' in data:
+                credits = round(float(data['credits']), 3)
+                print(f"  Credits: {credits}")
+                threshold = cfg.balance_threshold
+                if threshold is not None and credits < threshold:
+                    print(f"  WARNING: Credits {credits} < threshold {threshold}")
+            if 'subscription_status' in data:
+                print(f"  Subscription Status: {data['subscription_status']}")
+            if 'subscription_end' in data:
+                print(f"  Subscription End: {data['subscription_end']}")
+            if 'user_status' in data:
+                print(f"  User Status: {data['user_status']}")
+            if 'user_status_text' in data and data['user_status_text']:
+                print(f"  User Status Text: {data['user_status_text']}")
+        else:
+            log("Failed to retrieve balance", args.quiet)
+        return  # Exit after balance check
 
     # init logs
     log("Инициализация...", args.quiet)
@@ -656,6 +727,59 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         print(f"Saved group analysis to {out_path}")
         if usage and not args.quiet:
             print(f"USAGE: {usage}")
+
+
+def handle_json_request(request: dict) -> dict:
+    """
+    Handle JSON API request.
+    Request format: {"action": "analyze", "images": [...], "text": "...", "per_image": false, "check_balance": false, ...}
+    """
+    try:
+        action = request.get("action")
+        if action == "analyze":
+            # Similar to CLI, but return JSON
+            # For simplicity, reuse logic, but since it's complex, implement basic
+            # Actually, to keep simple, implement minimal
+            return {"ok": False, "error": "Analyze action not implemented yet"}
+        elif action == "check_balance":
+            cfg = load_config()
+            balance_data = get_balance(cfg)
+            if balance_data:
+                data = balance_data.get('data', {})
+                credits = data.get('credits')
+                if credits:
+                    credits = round(float(credits), 3)
+                response = {
+                    "ok": True,
+                    "balance": {
+                        "status": balance_data.get('status'),
+                        "credits": credits,
+                        "subscription_status": data.get('subscription_status'),
+                        "subscription_end": data.get('subscription_end'),
+                        "user_status": data.get('user_status'),
+                        "user_status_text": data.get('user_status_text'),
+                    }
+                }
+                threshold = cfg.balance_threshold
+                if threshold is not None and credits is not None and credits < threshold:
+                    response["balance"]["warning"] = f"Credits {credits} < threshold {threshold}"
+                return response
+            else:
+                return {"ok": False, "error": "Failed to retrieve balance"}
+        else:
+            return {"ok": False, "error": f"Unknown action: {action}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def handle_json_request_str(json_str: str) -> str:
+    import json
+    try:
+        request = json.loads(json_str)
+        response = handle_json_request(request)
+        return json.dumps(response, ensure_ascii=False)
+    except json.JSONDecodeError as e:
+        return json.dumps({"ok": False, "error": f"Invalid JSON: {e}"}, ensure_ascii=False)
 
 
 if __name__ == "__main__":

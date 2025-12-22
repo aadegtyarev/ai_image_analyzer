@@ -73,10 +73,8 @@ PROMPT_FILE=prompts/art_analysis.txt
   * `--OPENAI_MODEL`, `--OPENAI_TIMEOUT`, `--IMAGE_MAX_SIZE` и т.д.
 
 * `OPENAI_MAX_TOKENS` отвечает за максимальное число токенов, которое модель может сгенерировать (параметр `max_tokens`).
-* `OPENAI_CONTEXT_SIZE` задаёт окно контекста выбранной модели (в токенах). Если `OPENAI_MAX_TOKENS` будет больше чем `OPENAI_CONTEXT_SIZE`, скрипт **ограничит** `OPENAI_MAX_TOKENS` до `OPENAI_CONTEXT_SIZE - 1` и выведет предупреждение в stderr. По умолчанию `OPENAI_CONTEXT_SIZE=2048`.
-* `OPENAI_X_TITLE` — опциональный заголовок `X-Title`, который будет добавлен к запросам к API (если SDK поддерживает передачу headers). Используйте его для маркировки источника запросов, например `OPENAI_X_TITLE=ai_image_analyzer`.
 * `OPENAI_BALANCE_THRESHOLD` — опциональный числовой порог баланса (в валюте сервиса). Если включена проверка баланса (`--check-balance` или JSON `check_balance: true`) и фактический баланс меньше порога, скрипт вернёт предупреждение и добавит ошибку `Low balance` в поле `errors` JSON-ответа.
-* `--include-billing` / JSON `include_billing: true` — просит включать поля `usage` (prompt_tokens/completion_tokens/total_tokens) и `total_cost` в ответ при доступности этих данных от провайдера. Полезно для ботов и интеграций; учтите, что точность `total_cost` может не совпадать с биллингом в мелких десятичных знаках.
+* Поля `usage` (prompt_tokens/completion_tokens/total_tokens/total_cost) всегда включаются в JSON-ответ при доступности этих данных от провайдера. `total_cost` округляется до 3 знаков после запятой. В CLI выводится `USAGE:` с этой информацией после каждого анализа (если не указан `-q`).
 
 ---
 
@@ -95,7 +93,7 @@ python ai_image_analyzer.py [OPTIONS] [images...]
 * `-p, --PROMPT_FILE` — переопределить файл промта (`PROMPT_FILE` из `.env`).
 * `-t, --text` — текст для отправки как `user` (PROMPT_FILE игнорируется, файл не создаётся).
 * `--per-image` — анализ каждого изображения отдельным запросом (без коллажа, без group-файла).
-* `-q, --quiet` — тихий режим (минимум логов).
+* `-q, --quiet` — тихий режим (минимум логов, подавляет вывод USAGE).
 
 Параметры окружения, которые можно задать через CLI:
 
