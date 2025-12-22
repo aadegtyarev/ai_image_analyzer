@@ -24,7 +24,7 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from PIL import Image  # pillow
 try:
@@ -275,7 +275,7 @@ def call_model_with_image(
     system_prompt: str,
     user_text: Optional[str],
     quiet: bool,
-) -> str:
+) -> Tuple[str, Optional[Any]]:
     client = build_client(cfg)
     image_url = image_bytes_to_data_url(jpeg_bytes)
 
@@ -303,8 +303,11 @@ def call_model_with_image(
         timeout=cfg.timeout,
     )
     text = resp.choices[0].message.content or ""
+    usage = getattr(resp, "usage", None)
+    if usage and hasattr(usage, "total_cost"):
+        usage.total_cost = round(usage.total_cost, 3)
     log("Ответ модели (image) получен", quiet)
-    return text
+    return text, usage
 
 
 def call_model_with_text_only(
@@ -312,7 +315,7 @@ def call_model_with_text_only(
     text: str,
     system_prompt: str,
     quiet: bool,
-) -> str:
+) -> Tuple[str, Optional[Any]]:
     client = build_client(cfg)
 
     messages = []
@@ -333,8 +336,11 @@ def call_model_with_text_only(
         timeout=cfg.timeout,
     )
     result = resp.choices[0].message.content or ""
+    usage = getattr(resp, "usage", None)
+    if usage and hasattr(usage, "total_cost"):
+        usage.total_cost = round(usage.total_cost, 3)
     log("Ответ модели (text) получен", quiet)
-    return result
+    return result, usage
 
 
 def save_result_for_single_image(image_path: str, text: str) -> str:
@@ -514,8 +520,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     # TEXT-ONLY MODE
     if not image_paths and override_text:
-        result = call_model_with_text_only(cfg, override_text, system_prompt="", quiet=args.quiet)
+        result, usage = call_model_with_text_only(cfg, override_text, system_prompt="", quiet=args.quiet)
         print(result)
+        if usage and not args.quiet:
+            print(f"USAGE: {usage}")
         return
 
     # IMAGE MODES
@@ -556,7 +564,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             name = os.path.basename(img_path)
             log(f"Отправляем отдельно: {name}", args.quiet)
 
-            result = call_model_with_image(
+            result, usage = call_model_with_image(
                 cfg,
                 jpeg_bytes,
                 system_prompt=system_prompt,
@@ -568,9 +576,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 # Режим с override_text: выводим в консоль, не сохраняем в файл
                 print(f"\n===== {name} =====")
                 print(result)
+                if usage and not args.quiet:
+                    print(f"USAGE: {usage}")
             else:
                 out_path = save_result_for_single_image(img_path, result)
                 print(f"Saved analysis to {out_path}")
+                if usage and not args.quiet:
+                    print(f"USAGE: {usage}")
 
         return
 
@@ -589,7 +601,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 args.quiet,
             )
             jpeg_bytes = collage_bytes
-        result = call_model_with_image(
+        result, usage = call_model_with_image(
             cfg,
             jpeg_bytes,
             system_prompt="",
@@ -597,6 +609,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             quiet=args.quiet,
         )
         print(result)
+        if usage:
+            print(f"USAGE: {usage}")
         return
 
     # Обычный режим: PROMPT_FILE → system, без override_text
@@ -606,7 +620,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if len(resized) == 1:
         img_path, jpeg_bytes = resized[0]
         log("Режим: одна картинка, без override-текста", args.quiet)
-        result = call_model_with_image(
+        result, usage = call_model_with_image(
             cfg,
             jpeg_bytes,
             system_prompt=system_prompt,
@@ -615,6 +629,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
         out_path = save_result_for_single_image(img_path, result)
         print(f"Saved analysis to {out_path}")
+        if usage and not args.quiet:
+            print(f"USAGE: {usage}")
     else:
         log("Режим: несколько картинок → создаём коллаж", args.quiet)
         collage_bytes, filenames = make_collage(
@@ -628,7 +644,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             f"Коллаж готов, файлов в описании: {len(filenames)}",
             args.quiet,
         )
-        result = call_model_with_image(
+        result, usage = call_model_with_image(
             cfg,
             collage_bytes,
             system_prompt=collage_system_prompt,
@@ -638,6 +654,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         original_paths = [p for p, _ in resized]
         out_path = save_result_for_group(original_paths, result)
         print(f"Saved group analysis to {out_path}")
+        if usage and not args.quiet:
+            print(f"USAGE: {usage}")
 
 
 if __name__ == "__main__":
