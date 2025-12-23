@@ -1,902 +1,876 @@
 #!/usr/bin/env python3
-"""
-Telegram-bot helper for photographers, built on top of ai_image_analyzer.
-
-- Работает с JSON-API ai_image_analyzer.handle_json_request.
-- Динамически регистрирует команды по файлам в prompts/.
-- Поддерживает howto-заметки из папки howto/.
-- Ведёт список разрешённых пользователей и статистику в users.json.
-"""
-
 import asyncio
-import base64
-import json
-import logging
 import os
-from dataclasses import dataclass, asdict
-from datetime import datetime
-from typing import Dict, Optional, List, Tuple, Any
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.types import (
-    Message,
-    BotCommand,
-    BufferedInputFile,
-)
+import json
+import traceback
+from dataclasses import dataclass
+from typing import Dict, Any, List, Tuple, Optional
 
 from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, Router
+from aiogram.types import Message, FSInputFile, BotCommand
+from aiogram.enums import ParseMode, ChatType
+from aiogram.client.default import DefaultBotProperties
 
-from ai_image_analyzer import handle_json_request
-
-# ------------------ logging ------------------ #
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
+from ai_image_analyzer import (
+    load_config,
+    call_model_with_image,
+    call_model_with_text_only,
+    build_collage_system_prompt,
+    read_prompt_file,
+    make_collage,
+    check_balance,
 )
-log = logging.getLogger("photo_helper_bot")
+
+load_dotenv()
+
+# --- ENV / paths ---
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_ADMIN_ID = int(os.getenv("BOT_ADMIN_ID", "0"))
+BOT_ADMIN_USERNAME = os.getenv("BOT_ADMIN_USERNAME")
+
+PROMPTS_DIR = os.getenv("PROMPTS_DIR", "prompts")
+HOWTO_DIR = os.getenv("HOWTO_DIR", "howto")
+USERS_FILE = os.getenv("USERS_FILE", "db/users.json")
+
+PER_IMAGE_DEFAULT = os.getenv("PER_IMAGE_DEFAULT", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set in environment/.env")
+
+# --- aiogram wiring ---
+
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
+)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
+# --- users db & stats ---
+
+def _ensure_users_file_dir() -> None:
+    d = os.path.dirname(USERS_FILE)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
 
 
-# ------------------ config ------------------ #
-
-@dataclass
-class BotConfig:
-    token: str
-    admin_id: Optional[int]
-    admin_username: Optional[str]
-    prompts_dir: str
-    howto_dir: str
-    users_file: str
-    per_image_default: bool
-    default_prompt_file: Optional[str]
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def load_config() -> BotConfig:
-    load_dotenv()
-
-    token = os.getenv("BOT_TOKEN")
-    if not token:
-        raise SystemExit("BOT_TOKEN is not set in .env")
-
-    admin_id_str = os.getenv("BOT_ADMIN_ID")
-    admin_id = int(admin_id_str) if admin_id_str else None
-    admin_username = os.getenv("BOT_ADMIN_USERNAME")
-
-    prompts_dir = os.getenv("PROMPTS_DIR", "prompts")
-    howto_dir = os.getenv("HOWTO_DIR", "howto")
-    users_file = os.getenv("USERS_FILE", "users.json")
-
-    per_image_default = _env_bool("PER_IMAGE_DEFAULT", True)
-
-    default_prompt_file = os.getenv("PROMPT_FILE")
-
-    cfg = BotConfig(
-        token=token,
-        admin_id=admin_id,
-        admin_username=admin_username.lstrip("@") if admin_username else None,
-        prompts_dir=prompts_dir,
-        howto_dir=howto_dir,
-        users_file=users_file,
-        per_image_default=per_image_default,
-        default_prompt_file=default_prompt_file,
-    )
-    log.info("Config loaded: %s", cfg)
-    return cfg
-
-
-# ------------------ user store & stats ------------------ #
-
-@dataclass
-class UserStats:
-    enabled: bool = False
-    username: Optional[str] = None
-    full_name: Optional[str] = None
-    total_requests: int = 0
-    total_images: int = 0
-    total_megabytes: float = 0.0
-    total_tokens: int = 0
-    total_cost: float = 0.0
-    last_used: Optional[str] = None  # ISO8601
-
-
-class UserStore:
-    def __init__(self, path: str):
-        self.path = path
-        self.users: Dict[str, UserStats] = {}
-        self._loaded = False
-
-    def load(self) -> None:
-        if self._loaded:
-            return
-        if os.path.isfile(self.path):
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    raw = json.load(f)
-                for uid, data in raw.get("users", {}).items():
-                    self.users[uid] = UserStats(**data)
-                log.info("UserStore loaded: %d users", len(self.users))
-            except Exception as e:
-                log.error("Failed to load users file %s: %s", self.path, e)
-        else:
-            log.info("UserStore: no existing file, starting empty")
-        self._loaded = True
-
-    def save(self) -> None:
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        data = {"users": {uid: asdict(u) for uid, u in self.users.items()}}
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+def load_users() -> Dict[str, Any]:
+    _ensure_users_file_dir()
+    if not os.path.exists(USERS_FILE):
+        data = {"enabled": [], "stats": {}, "meta": {}}
+        with open(USERS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.path)
-        log.info("UserStore saved: %s", self.path)
-
-    def ensure_user(self, user_id: int, username: Optional[str], full_name: Optional[str]) -> UserStats:
-        self.load()
-        key = str(user_id)
-        if key not in self.users:
-            self.users[key] = UserStats(
-                enabled=False,
-                username=(username.lstrip("@") if username else None),
-                full_name=full_name,
-            )
-            self.save()
-        else:
-            u = self.users[key]
-            changed = False
-            if username and u.username != username.lstrip("@"):
-                u.username = username.lstrip("@")
-                changed = True
-            if full_name and u.full_name != full_name:
-                u.full_name = full_name
-                changed = True
-            if changed:
-                self.save()
-        return self.users[key]
-
-    def is_allowed(self, user_id: int, username: Optional[str], cfg: BotConfig) -> bool:
-        # Админ всегда разрешён
-        if cfg.admin_id is not None and user_id == cfg.admin_id:
-            return True
-        if cfg.admin_username and username and username.lstrip("@") == cfg.admin_username:
-            return True
-
-        user = self.ensure_user(user_id, username, None)
-        return user.enabled
-
-    def set_enabled_by_username(self, username: str, enabled: bool) -> bool:
-        username = username.lstrip("@")
-        self.load()
-        found = False
-        for u in self.users.values():
-            if u.username == username:
-                u.enabled = enabled
-                found = True
-        if found:
-            self.save()
-        return found
-
-    def all_users(self) -> List[Tuple[str, UserStats]]:
-        self.load()
-        return sorted(self.users.items(), key=lambda kv: int(kv[0]))
-
-    def add_stats(
-        self,
-        user_id: int,
-        username: Optional[str],
-        images_count: int,
-        total_bytes: int,
-        requests_count: int,
-        tokens_used: int,
-        total_cost: float,
-    ) -> None:
-        u = self.ensure_user(user_id, username, None)
-        u.total_requests += requests_count
-        u.total_images += images_count
-        u.total_megabytes += float(total_bytes) / (1024 * 1024)
-        u.total_tokens += tokens_used
-        u.total_cost += float(total_cost)
-        u.last_used = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-        self.save()
-
-    def reset_stats_all(self) -> None:
-        self.load()
-        for u in self.users.values():
-            u.total_requests = 0
-            u.total_images = 0
-            u.total_megabytes = 0.0
-            u.total_tokens = 0
-            u.total_cost = 0.0
-        self.save()
-
-    def reset_stats_username(self, username: str) -> bool:
-        username = username.lstrip("@")
-        self.load()
-        found = False
-        for u in self.users.values():
-            if u.username == username:
-                u.total_requests = 0
-                u.total_images = 0
-                u.total_megabytes = 0.0
-                u.total_tokens = 0
-                u.total_cost = 0.0
-                found = True
-        if found:
-            self.save()
-        return found
+        return data
+    with open(USERS_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data.setdefault("enabled", [])
+    data.setdefault("stats", {})
+    data.setdefault("meta", {})
+    return data
 
 
-# ------------------ prompts & howto ------------------ #
+def save_users(data: Dict[str, Any]) -> None:
+    _ensure_users_file_dir()
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def scan_prompts(prompts_dir: str) -> Dict[str, str]:
-    mapping: Dict[str, str] = {}
-    if not os.path.isdir(prompts_dir):
-        log.warning("Prompts dir %r not found", prompts_dir)
-        return mapping
-    for name in sorted(os.listdir(prompts_dir)):
-        path = os.path.join(prompts_dir, name)
-        if not os.path.isfile(path):
+
+users_db: Dict[str, Any] = load_users()
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id == BOT_ADMIN_ID
+
+
+def is_allowed(user_id: int) -> bool:
+    if is_admin(user_id):
+        return True
+    return user_id in users_db.get("enabled", [])
+
+
+def ensure_stats(uid: int) -> None:
+    stats = users_db.setdefault("stats", {})
+    key = str(uid)
+    if key not in stats:
+        stats[key] = {
+            "requests": 0,
+            "images": 0,
+            "megabytes": 0.0,
+            "total_tokens": 0,
+            "total_cost": 0.0,
+        }
+
+
+def update_stats_after_call(
+    uid: int,
+    images: int,
+    bytes_sent: int,
+    usage: Optional[dict],
+) -> None:
+    ensure_stats(uid)
+    s = users_db["stats"][str(uid)]
+    s["requests"] += 1
+    s["images"] += images
+    s["megabytes"] += bytes_sent / (1024.0 * 1024.0)
+    if usage:
+        s["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
+        try:
+            s["total_cost"] += float(usage.get("total_cost", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pass
+    save_users(users_db)
+
+
+def set_user_meta(uid: int, description: str, username: str = "", full_name: str = ""):
+    meta = users_db.setdefault("meta", {})
+    meta[str(uid)] = {
+        "description": description,
+        "username": username,
+        "full_name": full_name,
+    }
+    save_users(users_db)
+
+# --- markdown escape ---
+
+def escape_md(text: str) -> str:
+    """Простейшее экранирование под Telegram Markdown (v1)."""
+    for ch in ("\\", "_", "*", "[", "]", "(", ")"):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def escape_md_smart(text: str) -> str:
+    """Экранирование Markdown, пропуская части внутри `...`."""
+    parts = text.split('`')
+    for i in range(len(parts)):
+        if i % 2 == 0:  # вне backticks
+            parts[i] = escape_md(parts[i])
+    return '`'.join(parts)
+
+# --- prompts & commands ---
+
+@dataclass
+class PromptInfo:
+    command: str
+    filename: str
+    path: str
+    description: str
+
+
+RESERVED_COMMANDS = {
+    "start",
+    "help",
+    "howto",
+    "stats",
+    "stats_all",
+    "users",
+    "balance",
+}
+
+
+def sanitize_command_name(base: str, used: set, idx: int) -> str:
+    name = base.lower()
+    allowed = "abcdefghijklmnopqrstuvwxyz0123456789_"
+    name = "".join(c if c in allowed else "_" for c in name)
+    name = name.strip("_")
+
+    if not name:
+        name = f"p_{idx}"
+
+    if not name[0].isalpha():
+        name = f"p_{name}"
+
+    if len(name) > 32:
+        name = name[:32]
+
+    orig = name
+    suffix = 1
+    while name in used or name in RESERVED_COMMANDS:
+        candidate = f"{orig}_{suffix}"
+        if len(candidate) > 32:
+            candidate = candidate[:32]
+        name = candidate
+        suffix += 1
+
+    used.add(name)
+    return name
+
+
+def load_prompts() -> Dict[str, PromptInfo]:
+    prompts: Dict[str, PromptInfo] = {}
+    if not os.path.isdir(PROMPTS_DIR):
+        return prompts
+
+    used_commands: set = set()
+    idx = 1
+
+    for fname in sorted(os.listdir(PROMPTS_DIR)):
+        if not fname.lower().endswith(".txt"):
             continue
-        if not name.lower().endswith((".txt", ".md")):
-            continue
-        base = os.path.splitext(name)[0]
-        mapping[base] = path
-    log.info("Found %d prompts: %s", len(mapping), ", ".join(mapping.keys()))
-    return mapping
+        base = os.path.splitext(fname)[0]
+        cmd = sanitize_command_name(base, used_commands, idx)
+        idx += 1
+
+        path = os.path.join(PROMPTS_DIR, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                first_line = f.readline().strip()
+        except OSError:
+            first_line = ""
+        desc = first_line[:80] if first_line else f"Prompt from {fname}"
+        prompts[cmd] = PromptInfo(
+            command=cmd,
+            filename=fname,
+            path=path,
+            description=desc,
+        )
+    return prompts
 
 
-def scan_howto(howto_dir: str) -> Dict[str, str]:
-    mapping: Dict[str, str] = {}
-    if not os.path.isdir(howto_dir):
-        log.info("Howto dir %r not found, skipping", howto_dir)
-        return mapping
-    for name in sorted(os.listdir(howto_dir)):
-        path = os.path.join(howto_dir, name)
-        if not os.path.isfile(path):
-            continue
-        if not name.lower().endswith(".md"):
-            continue
-        base = os.path.splitext(name)[0]
-        mapping[base] = path
-    log.info("Found %d howto files: %s", len(mapping), ", ".join(mapping.keys()))
-    return mapping
+PROMPTS: Dict[str, PromptInfo] = load_prompts()
 
 
-# ------------------ helpers ------------------ #
+async def setup_bot_commands() -> None:
+    # очистить и зарегистрировать список команд
+    await bot.set_my_commands([])
 
-def parse_command_and_args(text: str, bot_username: Optional[str]) -> Tuple[Optional[str], str]:
-    """
-    Возвращает (command, args_text_without_command).
+    cmds: List[BotCommand] = []
 
-    command без '/', без @botname.
-    """
-    text = text.strip()
-    if not text.startswith("/"):
-        return None, text
+    cmds.append(BotCommand(command="text", description="Текст вместо промта (для фото)"))
+    cmds.append(
+        BotCommand(
+            command="text_collage",
+            description="Текст + коллаж для нескольких фото",
+        )
+    )
+    cmds.append(BotCommand(command="howto", description="Список howto-заметок"))
+    cmds.append(BotCommand(command="stats", description="Статистика по запросам"))
+    cmds.append(BotCommand(command="help", description="Справка и список промтов"))
 
-    first, _, rest = text.partition(" ")
+    await bot.set_my_commands(cmds[:100])
+
+# --- helpers ---
+
+def extract_command_and_text(msg: Message) -> Tuple[Optional[str], str]:
+    raw = (msg.text or msg.caption or "").strip()
+    if not raw.startswith("/"):
+        return None, raw
+    first, *rest = raw.split(maxsplit=1)
     cmd = first[1:]
     if "@" in cmd:
-        cmd, _, at = cmd.partition("@")
-        if bot_username and at.lower() != bot_username.lower():
-            # команда не для этого бота
-            return None, text
-
-    return cmd, rest.strip()
+        cmd = cmd.split("@", 1)[0]
+    tail = rest[0].strip() if rest else ""
+    return cmd, tail
 
 
-def strip_collage_flag(args: str) -> Tuple[str, bool]:
-    tokens = args.split()
-    remaining: List[str] = []
-    collage = False
-    for t in tokens:
-        tl = t.lower()
-        if tl in ("collage", "коллаж"):
-            collage = True
-        else:
-            remaining.append(t)
-    return " ".join(remaining).strip(), collage
+def normalize_command(cmd: Optional[str]) -> Optional[str]:
+    if not cmd:
+        return None
+    c = cmd
+    no_underscore = c.replace("_", "").lower()
+    if no_underscore == "statsall":
+        return "stats_all"
+    if no_underscore == "statsreset":
+        return "stats_reset"
+    if no_underscore == "userdel":
+        return "user_del"
+    return c
 
 
-async def collect_images_from_message(message: Message) -> List[Tuple[str, bytes, int]]:
-    """
-    Собирает изображения из самого сообщения и, если это reply,
-    из сообщения, на которое отвечаем.
-
-    Возвращает список (name, bytes, size_bytes).
-    """
-    images: List[Tuple[str, bytes, int]] = []
-
-    async def _extract_from(msg: Message) -> None:
-        if msg.photo:
-            photo = msg.photo[-1]
-            file = await msg.bot.get_file(photo.file_id)
-            b = await msg.bot.download_file(file.file_path)
-            content = b.read()
-            name = f"photo_{photo.file_unique_id}.jpg"
-            images.append((name, content, len(content)))
-        elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image/"):
-            doc = msg.document
-            file = await msg.bot.get_file(doc.file_id)
-            b = await msg.bot.download_file(file.file_path)
-            content = b.read()
-            name = doc.file_name or f"doc_{doc.file_unique_id}.jpg"
-            images.append((name, content, len(content)))
-
-    await _extract_from(message)
-    if message.reply_to_message:
-        await _extract_from(message.reply_to_message)
-
-    return images
+def get_cfg():
+    return load_config()
 
 
-def build_analyzer_request(
-    *,
-    images: List[Tuple[str, bytes, int]],
-    prompt_file: Optional[str],
-    override_text: Optional[str],
-    per_image: bool,
-) -> dict:
-    images_payload = [
-        {
-            "name": name,
-            "data_b64": base64.b64encode(data).decode("ascii"),
-        }
-        for (name, data, _size) in images
+async def send_text_or_file(
+    msg: Message,
+    text: str,
+    filename_prefix: str = "response",
+) -> None:
+    if not text:
+        await msg.answer("⚠ Пустое сообщение.", parse_mode=None)
+        return
+    if len(text) <= 3800:
+        await msg.answer(text)
+    else:
+        tmp_path = f"/tmp/{filename_prefix}_{msg.message_id}.txt"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        await msg.answer_document(FSInputFile(tmp_path))
+
+
+async def safe_error_reply(msg: Message, err: Exception) -> None:
+    traceback.print_exc()
+    if msg.from_user and is_admin(msg.from_user.id):
+        text = f"❌ Внутренняя ошибка: {err}"
+    else:
+        text = "❌ Что-то пошло не так при обработке запроса."
+    try:
+        await msg.answer(text, parse_mode=None)
+    except Exception:
+        traceback.print_exc()
+
+
+async def send_howto_list(msg: Message) -> None:
+    if not os.path.isdir(HOWTO_DIR):
+        await msg.answer("📚 Папка howto пуста или недоступна.", parse_mode=None)
+        return
+    files = [
+        f[:-3] for f in os.listdir(HOWTO_DIR) if f.lower().endswith(".md")
     ]
-    req = {
-        "action": "analyze",
-        "prompt_file": prompt_file,
-        "override_text": override_text,
-        "per_image": per_image,
-        "quiet": True,
-        "include_billing": True,
-        "images": images_payload,
-        "overrides": {},
-    }
-    return req
+    if not files:
+        await msg.answer("📚 Пока нет howto-заметок.", parse_mode=None)
+        return
+    lines = ["📚 Доступные howto:"]
+    for name in sorted(files):
+        lines.append(f"`/howto {name}`")
+    await msg.answer("\n".join(lines))
 
 
-def summarize_usage(resp: dict) -> Tuple[int, int, float]:
-    """
-    Суммарная статистика по ответу анализатора:
-    - requests_count: количество модельных вызовов
-    - total_tokens: суммарное число токенов
-    - total_cost: суммарная стоимость (если провайдер вернул total_cost/cost)
-    """
-    requests_count = 0
-    total_tokens = 0
-    total_cost = 0.0
+async def send_howto_item(msg: Message, name: str) -> None:
+    path = os.path.join(HOWTO_DIR, f"{name}.md")
+    if not os.path.exists(path):
+        await msg.answer("❌ Нет такого howto.", parse_mode=None)
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        body = f.read()
+    if not body.strip():
+        await msg.answer("⚠ Файл howto пуст.", parse_mode=None)
+        return
+    # howto — это наш markdown из файла, отдаём как есть
+    await send_text_or_file(msg, body, filename_prefix=f"howto_{name}")
 
-    def _acc_usage(u: Any) -> None:
-        nonlocal requests_count, total_tokens, total_cost
-        if not isinstance(u, dict):
+
+async def handle_help(msg: Message) -> None:
+    if not is_allowed(msg.from_user.id):
+        return
+
+    lines: List[str] = [
+        "AI Photo Assistant",
+        "",
+        "📷 Отправь фото — получишь разбор.",
+        "✍ Если вместе с фото написать текст, он заменит системный промт.",
+        "",
+        "🎯 Промты (файлы из папки prompts):",
+    ]
+
+    if PROMPTS:
+        for cmd, p in sorted(PROMPTS.items()):
+            desc = p.description or ""
+            line = f"`/{cmd}` - {escape_md(desc)}"
+            lines.append(line)
+    else:
+        lines.append("(папка PROMPTS_DIR пуста)")
+
+    lines.extend(
+        [
+            "",
+            "🛠 Режимы:",
+            "`/text` – использовать текст сообщения как запрос (без системного промта).",
+            "`/text_collage` – то же, но несколько фото собираются в коллаж.",
+            "/howto – список howto-заметок.",
+            "/stats – твоя личная статистика.",
+            "/help – краткая справка.",
+        ]
+    )
+
+    if is_admin(msg.from_user.id) and msg.chat.type == ChatType.PRIVATE:
+        lines.extend(
+            [
+                "",
+                "👑 Админ-команды (ручной ввод):",
+                "/users – список разрешённых пользователей.",
+                "`/user_add USER_ID` Описание – добавить пользователя.",
+                "`/user_del USER_ID` – удалить пользователя.",
+                "`/stats_reset USER_ID` – сброс статистики пользователя.",
+                "/stats_all – общая статистика по всем.",
+                "/balance – баланс API.",
+            ]
+        )
+
+    safe_lines = [escape_md_smart(line) for line in lines]
+    await msg.answer("\n".join(safe_lines))
+
+
+async def extract_images_from_message(message: Message) -> List[bytes]:
+    """Скачать все подходящие картинки из сообщения (photo, document image/*)."""
+    res: List[bytes] = []
+    if message.photo:
+        largest = message.photo[-1]
+        file = await bot.get_file(largest.file_id)
+        b = await bot.download_file(file.file_path)
+        res.append(b.read())
+    if (
+        message.document
+        and message.document.mime_type
+        and message.document.mime_type.startswith("image/")
+    ):
+        file = await bot.get_file(message.document.file_id)
+        b = await bot.download_file(file.file_path)
+        res.append(b.read())
+    return res
+
+# --- main handler ---
+
+@router.message()
+async def main_handler(msg: Message) -> None:
+    try:
+        user_id = msg.from_user.id if msg.from_user else 0
+        cmd, tail = extract_command_and_text(msg)
+        cmd = normalize_command(cmd)
+
+        if not is_allowed(user_id):
             return
-        requests_count += 1
-        try:
-            total_tokens_local = int(u.get("total_tokens", 0) or 0)
-        except Exception:
-            total_tokens_local = 0
-        total_tokens += total_tokens_local
-        cost_val = u.get("total_cost") or u.get("cost")
-        if cost_val is not None:
+
+        # --- сервис / админ ---
+
+        if cmd == "help":
+            await handle_help(msg)
+            return
+
+        if cmd == "howto":
+            if not tail:
+                await send_howto_list(msg)
+            else:
+                await send_howto_item(msg, tail)
+            return
+
+        if cmd == "users":
+            if not is_admin(user_id):
+                return
+            enabled = users_db.get("enabled", [])
+            meta = users_db.get("meta", {})
+            if enabled:
+                lines = ["👥 Разрешённые пользователи:"]
+                for uid in enabled:
+                    info = meta.get(str(uid), {})
+                    username = info.get("username") or ""
+                    desc = info.get("description") or ""
+                    line = str(uid)
+                    if username:
+                        line += f" @{username}"
+                    if desc:
+                        line += f" — {desc}"
+                    lines.append(line)
+                text = "\n".join(lines)
+            else:
+                text = "👥 Список пуст."
+            await msg.answer(text, parse_mode=None)
+            return
+
+        if cmd == "user_add":
+            if not is_admin(user_id):
+                return
+            if not tail:
+                await msg.answer(
+                    "Использование: `/user_add USER_ID` Описание",                    
+                )
+                return
+
+            parts = tail.split(maxsplit=2)
+            if len(parts) < 2:
+                await msg.answer(
+                    "Нужно указать и ID, и описание.\n"
+                    "Пример: `/user_add 7045549272 мой коллега`",                    
+                )
+                return
+
+            first = parts[0]
+            if first.startswith("@"):
+                await msg.answer(
+                    "По @username бот не может получить ID пользователя. "
+                    "Нужен числовой ID.\n\n"
+                    "Пример: `/user_add 7045549272 мой коллега`",                    
+                )
+                return
+
             try:
-                total_cost += float(cost_val)
+                uid = int(first)
+            except ValueError:
+                await msg.answer(
+                    "Укажи числовой ID пользователя.\n"
+                    "Пример: `/user_add 7045549272 мой коллега`",                    
+                )
+                return
+
+            if len(parts) == 2:
+                description = parts[1]
+            else:
+                description = parts[1] + " " + parts[2]
+
+            username = ""
+            full_name = ""
+            try:
+                chat = await bot.get_chat(uid)
+                username = chat.username or ""
+                full_name = " ".join(
+                    [p for p in [chat.first_name, chat.last_name] if p]
+                )
             except Exception:
                 pass
 
-    if "usage" in resp:
-        _acc_usage(resp.get("usage"))
-
-    for item in resp.get("results") or []:
-        u = item.get("usage")
-        if u:
-            _acc_usage(u)
-
-    return requests_count, total_tokens, total_cost
-
-
-async def send_result_text_or_file(status_msg: Message, text: str, filename_prefix: str) -> None:
-    """
-    Для ответов модели: если текст помещается — редактируем статус этим текстом.
-    Если нет — пишем короткое сообщение и прикладываем txt-файл с полным ответом.
-    """
-    MAX_LEN = 4000
-    if len(text) <= MAX_LEN:
-        await status_msg.edit_text(text or "Пустой ответ от модели.")
-        return
-
-    await status_msg.edit_text(
-        "Ответ модели получен, он длиннее лимита Telegram.\n"
-        "Прикрепляю полный текст в файле."
-    )
-    data = text.encode("utf-8")
-    fname = f"{filename_prefix}.txt"
-    file = BufferedInputFile(data, filename=fname)
-    await status_msg.answer_document(
-        document=file,
-        caption="Полный ответ модели в txt-файле.",
-    )
-
-
-async def send_text_message_or_file(message: Message, text: str, filename_prefix: str) -> None:
-    """
-    Для howto и других «просто сообщений»:
-    если текст помещается — отправляем как обычное сообщение;
-    если нет — отправляем текст-файл.
-    """
-    MAX_LEN = 4000
-    if len(text) <= MAX_LEN:
-        await message.reply(text)
-        return
-
-    await message.reply(
-        "Текст длиннее лимита Telegram.\n"
-        "Прикрепляю полный текст в файле."
-    )
-    data = text.encode("utf-8")
-    fname = f"{filename_prefix}.txt"
-    file = BufferedInputFile(data, filename=fname)
-    await message.answer_document(
-        document=file,
-        caption=f"{filename_prefix}.txt",
-    )
-
-
-# ------------------ main bot logic ------------------ #
-
-cfg: BotConfig
-user_store: UserStore
-prompts: Dict[str, str]
-howtos: Dict[str, str]
-bot_username_cache: Optional[str] = None
-
-
-def _ensure_admin(message: Message) -> bool:
-    user = message.from_user
-    if not user:
-        return False
-    uid = user.id
-    uname = user.username
-    if cfg.admin_id is not None and uid == cfg.admin_id:
-        return True
-    if cfg.admin_username and uname and uname.lstrip("@") == cfg.admin_username:
-        return True
-    return False
-
-
-def _is_allowed_or_admin(message: Message) -> bool:
-    user = message.from_user
-    if not user:
-        return False
-    if _ensure_admin(message):
-        return True
-    return user_store.is_allowed(user.id, user.username, cfg)
-
-
-async def cmd_help(message: Message):
-    if not _is_allowed_or_admin(message):
-        return
-    await message.reply(
-        "Я помогаю разбирать и обсуждать ваши фотографии.\n\n"
-        "• Пришлите фото (или несколько) — я разберу их по умолчательному промту.\n"
-        "• Добавьте команду с промтом, например: `/art_analysis`.\n"
-        "• Добавьте слово `collage`, чтобы склеить несколько фото в один коллаж.\n"
-        "• Используйте `/text` — чтобы задать свой текст вместо системного промта.\n"
-        "• `/howto` — список howto-заметок, `/howto имя` — показать одну.\n",
-        parse_mode="Markdown",
-    )
-
-
-async def cmd_howto(message: Message):
-    if not _is_allowed_or_admin(message):
-        return
-
-    text = message.text or message.caption or ""
-    _, args = text.split(maxsplit=1) if " " in text else (text, "")
-    name = args.strip()
-
-    if not name:
-        if not howtos:
-            await message.reply("Пока нет доступных howto-заметок.")
+            enabled = users_db.setdefault("enabled", [])
+            if uid not in enabled:
+                enabled.append(uid)
+            set_user_meta(uid, description=description, username=username, full_name=full_name)
+            await msg.answer(
+                f"✅ Пользователь `{uid}` добавлен в список.",                
+            )
             return
-        names = ", ".join(sorted(howtos.keys()))
-        await message.reply(
-            "Доступные howto:\n"
-            f"{names}\n\n"
-            "Используй `/howto имя`, например: `/howto posing`.",
-            parse_mode="Markdown",
-        )
-        return
 
-    key = name.strip()
-    if key not in howtos:
-        await message.reply(f"Не знаю howto `{key}`.", parse_mode="Markdown")
-        return
+        if cmd == "user_del":
+            if not is_admin(user_id):
+                return
+            if not tail:
+                await msg.answer(
+                    "Использование: `/user_del USER_ID`",                    
+                )
+                return
+            try:
+                uid = int(tail.split()[0])
+            except ValueError:
+                await msg.answer("Укажи числовой ID пользователя.", parse_mode=None)
+                return
+            enabled = users_db.setdefault("enabled", [])
+            if uid in enabled:
+                enabled.remove(uid)
+            users_db.setdefault("meta", {}).pop(str(uid), None)
+            save_users(users_db)
+            await msg.answer(
+                f"❌ Пользователь `{uid}` удалён из списка.",                
+            )
+            return
 
-    path = howtos[key]
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-    except OSError as e:
-        await message.reply(f"Не удалось прочитать howto `{key}`: {e}")
-        return
+        if cmd == "stats":
+            ensure_stats(user_id)
+            s = users_db["stats"][str(user_id)]
+            txt = (
+                "📊 *Твоя статистика*\n\n"
+                f"Запросов: *{s['requests']}*\n"
+                f"Файлов: *{s['images']}*\n"
+                f"Объём: *{s['megabytes']:.2f} MB*\n"
+                f"Токены: *{s['total_tokens']}*\n"
+                f"Стоимость: *{s['total_cost']:.3f}* у.е.\n"
+            )
+            await msg.answer(txt)
+            return
 
-    await send_text_message_or_file(message, content, f"howto_{key}")
+        if cmd == "stats_reset":
+            if not is_admin(user_id):
+                return
+            if not tail:
+                await msg.answer(
+                    "Использование: `/stats_reset USER_ID`",                    
+                )
+                return
+            uid = tail.split()[0]
+            ensure_stats(int(uid))
+            users_db["stats"][uid] = {
+                "requests": 0,
+                "images": 0,
+                "megabytes": 0.0,
+                "total_tokens": 0,
+                "total_cost": 0.0,
+            }
+            save_users(users_db)
+            await msg.answer(
+                f"🧹 Статистика пользователя `{uid}` сброшена.",                
+            )
+            return
 
+        if cmd == "stats_all":
+            if not is_admin(user_id):
+                return
+            stats = users_db.get("stats", {})
+            meta = users_db.get("meta", {})
+            if not stats:
+                await msg.answer("📊 Статистика пока пуста.", parse_mode=None)
+                return
+            total_req = total_img = total_tok = 0
+            total_mb = total_cost = 0.0
+            lines = ["📊 Общая статистика", ""]
+            for uid, s in stats.items():
+                r = s.get("requests", 0)
+                i = s.get("images", 0)
+                mb = s.get("megabytes", 0.0)
+                tok = s.get("total_tokens", 0)
+                cost = s.get("total_cost", 0.0)
+                meta_info = meta.get(uid, {})
+                desc = meta_info.get("description") or ""
+                label = uid
+                if desc:
+                    label = f"{uid} ({desc})"
+                total_req += r
+                total_img += i
+                total_mb += mb
+                total_tok += tok
+                total_cost += cost
+                lines.append(
+                    f"{label}: запросы {r}, файлы {i}, токены {tok}, "
+                    f"объём {mb:.2f} MB, стоимость {cost:.3f} у.е."
+                )
+            lines.append(
+                f"Итого: запросы {total_req}, файлы {total_img}, "
+                f"объём {total_mb:.2f} MB, токены {total_tok}, "
+                f"стоимость {total_cost:.3f} у.е."
+            )
+            await msg.answer("\n\n".join(lines), parse_mode=None)
+            return
 
-async def cmd_user_add(message: Message):
-    if not _ensure_admin(message):
-        return
+        if cmd == "balance":
+            if not is_admin(user_id):
+                return
+            try:
+                cfg = get_cfg()
+                data = check_balance(cfg, quiet=True) or {}
+                d = data.get("data", {})
+                try:
+                    credits = float(d.get("credits", 0.0))
+                except (TypeError, ValueError):
+                    credits = 0.0
+                sub_status = d.get("subscription_status", "")
+                sub_end = d.get("subscription_end", "")
+                user_status_text = d.get("user_status_text", "")
 
-    text = message.text or ""
-    parts = text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply("Использование: `user_add @username`", parse_mode="Markdown")
-        return
-    username = parts[1].strip().lstrip("@")
-    if not username:
-        await message.reply("Нужно указать username.", parse_mode="Markdown")
-        return
+                text = (
+                    "💳 Баланс API\n\n"
+                    f"Кредиты: {credits:.3f}\n"
+                    f"Статус подписки: {sub_status}\n"
+                    f"Подписка до: {sub_end}\n"
+                )
+                if user_status_text:
+                    text += f"Комментарий: {user_status_text}\n"
+                await msg.answer(text, parse_mode=None)
+            except Exception as e:
+                await safe_error_reply(msg, e)
+            return
 
-    ok = user_store.set_enabled_by_username(username, True)
-    if ok:
-        await message.reply(f"Пользователь @{username} включён.")
-    else:
-        await message.reply(
-            f"Не нашёл @{username} в базе. Человек должен сначала отправить хоть одно сообщение боту."
-        )
+        # --- аналитика ---
 
+        cfg = get_cfg()
 
-async def cmd_user_del(message: Message):
-    if not _ensure_admin(message):
-        return
+        # собираем изображения: сначала из самого сообщения,
+        # если нет — из reply_to_message
+        images_bytes: List[bytes] = []
+        images_bytes.extend(await extract_images_from_message(msg))
+        if not images_bytes and msg.reply_to_message:
+            images_bytes.extend(await extract_images_from_message(msg.reply_to_message))
 
-    text = message.text or ""
-    parts = text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply("Использование: `user_del @username`", parse_mode="Markdown")
-        return
-    username = parts[1].strip().lstrip("@")
-    if not username:
-        await message.reply("Нужно указать username.", parse_mode="Markdown")
-        return
+        text_after_cmd = tail
 
-    ok = user_store.set_enabled_by_username(username, False)
-    if ok:
-        await message.reply(f"Пользователь @{username} выключен.")
-    else:
-        await message.reply(f"Не нашёл @{username} в базе.")
+        use_text_override = False
+        force_collage = False
+        prompt_path: Optional[str] = None
 
-
-async def cmd_users(message: Message):
-    if not _ensure_admin(message):
-        return
-
-    lines: List[str] = []
-    for uid, u in user_store.all_users():
-        mark = "✅" if u.enabled else "❌"
-        name = f"@{u.username}" if u.username else "(нет username)"
-        lines.append(
-            f"{mark} {uid}: {name}, "
-            f"req={u.total_requests}, img={u.total_images}, "
-            f"MB={u.total_megabytes:.2f}, tokens={u.total_tokens}, "
-            f"cost={u.total_cost:.4f}"
-        )
-    if not lines:
-        await message.reply("Пока нет ни одного пользователя.")
-    else:
-        await message.reply("Пользователи:\n" + "\n".join(lines))
-
-
-async def cmd_stats(message: Message):
-    if not _ensure_admin(message):
-        return
-
-    lines: List[str] = []
-    total_req = total_img = total_tokens = 0
-    total_mb = 0.0
-    total_cost = 0.0
-    for uid, u in user_store.all_users():
-        total_req += u.total_requests
-        total_img += u.total_images
-        total_mb += u.total_megabytes
-        total_tokens += u.total_tokens
-        total_cost += u.total_cost
-        name = f"@{u.username}" if u.username else "(нет username)"
-        lines.append(
-            f"{uid} {name}: req={u.total_requests}, img={u.total_images}, "
-            f"MB={u.total_megabytes:.2f}, tokens={u.total_tokens}, "
-            f"cost={u.total_cost:.4f}"
-        )
-    header = (
-        f"Суммарно: req={total_req}, img={total_img}, "
-        f"MB={total_mb:.2f}, tokens={total_tokens}, cost={total_cost:.4f}\n"
-    )
-    if not lines:
-        await message.reply(header + "Пока нет ни одного пользователя.")
-    else:
-        await message.reply(header + "\n".join(lines))
-
-
-async def cmd_stats_reset(message: Message):
-    if not _ensure_admin(message):
-        return
-
-    text = message.text or ""
-    parts = text.split(maxsplit=1)
-    if len(parts) == 1:
-        user_store.reset_stats_all()
-        await message.reply("Статистика всех пользователей сброшена.")
-        return
-
-    arg = parts[1].strip()
-    if arg.lower() == "all":
-        user_store.reset_stats_all()
-        await message.reply("Статистика всех пользователей сброшена.")
-        return
-
-    username = arg.lstrip("@")
-    ok = user_store.reset_stats_username(username)
-    if ok:
-        await message.reply(f"Статистика пользователя @{username} сброшена.")
-    else:
-        await message.reply(f"Не нашёл @{username} в базе.")
-
-
-async def cmd_billing(message: Message):
-    """Админ-команда: запрос баланса у провайдера через JSON-API анализатора."""
-    if not _ensure_admin(message):
-        return
-
-    status = await message.reply("Запрашиваю баланс провайдера…")
-    req = {"action": "analyze", "check_balance": True, "quiet": True}
-    resp = handle_json_request(req)
-
-    if not resp.get("ok"):
-        errs = resp.get("errors") or []
-        err_text = "; ".join(str(e) for e in errs) or str(resp.get("error") or "unknown error")
-        await status.edit_text(f"Не удалось получить баланс: {err_text}")
-        return
-
-    balance = resp.get("balance")
-    errs = resp.get("errors") or []
-
-    lines: List[str] = []
-    if isinstance(balance, dict):
-        bal_val = balance.get("balance") or balance.get("available") or balance.get("value")
-        currency = balance.get("currency") or balance.get("unit") or "$"
-        if bal_val is not None:
-            lines.append(f"Баланс: {bal_val} {currency}")
+        if cmd in ("text", "text_collage"):
+            use_text_override = True
+            force_collage = cmd == "text_collage"
+        elif cmd in PROMPTS:
+            prompt_path = PROMPTS[cmd].path
+            if text_after_cmd:
+                use_text_override = True
         else:
-            lines.append("Баланс (сырые данные):")
-            lines.append(json.dumps(balance, ensure_ascii=False, indent=2))
-    else:
-        lines.append("Баланс (сырые данные):")
-        lines.append(repr(balance))
+            if text_after_cmd:
+                use_text_override = True
 
-    if errs:
-        lines.append("\nСообщения:")
-        lines.extend(str(e) for e in errs)
+        # только текст
+        if not images_bytes:
+            if not text_after_cmd:
+                await msg.answer("Нет ни изображений, ни текста.", parse_mode=None)
+                return
+            await msg.answer("💭 Думаю над текстом...", parse_mode=None)
+            resp = call_model_with_text_only(
+                cfg,
+                text_after_cmd,
+                system_prompt="",
+                quiet=True,
+            )
+            if isinstance(resp, tuple):
+                text_result, usage = resp
+            else:
+                text_result, usage = resp, None
+            update_stats_after_call(
+                user_id,
+                images=0,
+                bytes_sent=0,
+                usage=usage,
+            )
+            total_cost = 0.0
+            if usage:
+                try:
+                    total_cost = float(usage.get("total_cost", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    total_cost = 0.0
+            safe_body = escape_md(text_result)
+            final = safe_body
+            if total_cost > 0:
+                final += f"\n\n*💎 {total_cost:.3f} у.е.*"
+            await send_text_or_file(msg, final, filename_prefix="text")
+            return
 
-    await send_text_message_or_file(message, "\n".join(lines), "billing")
+        # есть изображения — сначала ресайз
+        from PIL import Image
+        import io as _io
 
+        def resize_bytes(data: bytes, max_size: int, quality: int) -> bytes:
+            with Image.open(_io.BytesIO(data)) as im:
+                im = im.convert("RGB")
+                w, h = im.size
+                scale = min(1.0, float(max_size) / max(w, h))
+                if scale < 1.0:
+                    new_size = (int(w * scale), int(h * scale))
+                    im = im.resize(new_size, Image.LANCZOS)
+                buf = _io.BytesIO()
+                im.save(buf, format="JPEG", quality=quality, optimize=True)
+                return buf.getvalue()
 
-async def handle_any(message: Message):
-    """
-    Главный обработчик: команды промтов, /text, "без команды" и т.п.
-    """
-    global bot_username_cache
+        resized: List[bytes] = [
+            resize_bytes(b, cfg.image_max_size, cfg.image_quality)
+            for b in images_bytes
+        ]
 
-    user = message.from_user
-    if not user:
-        return
-
-    # Обновляем/создаём запись пользователя
-    user_store.ensure_user(user.id, user.username, user.full_name)
-
-    # Проверка доступа (неразрешённых тихо игнорируем)
-    if not _is_allowed_or_admin(message):
-        return
-
-    # Определяем username бота, чтобы корректно резать /cmd@botname
-    if not bot_username_cache:
-        me = await message.bot.get_me()
-        bot_username_cache = me.username
-
-    text_full = (message.text or message.caption or "").strip()
-
-    cmd, args = parse_command_and_args(text_full, bot_username_cache)
-    args_without_collage, collage_flag = strip_collage_flag(args)
-
-    # Собираем изображения
-    images = await collect_images_from_message(message)
-    images_count = len(images)
-
-    # Определяем промт/override_text
-    prompt_file: Optional[str] = None
-    override_text: Optional[str] = None
-
-    # Служебные команды здесь не обрабатываем
-    if cmd in {"help", "howto", "user_add", "user_del", "users", "stats", "stats_reset", "billing", "start"}:
-        return
-
-    # Команда /text — всегда override_text
-    if cmd == "text":
-        override_text = args_without_collage or None
-        prompt_file = None
-
-    # Команда соответствует одному из промтов
-    elif cmd and cmd in prompts:
-        prompt_file = prompts[cmd]
-        override_text = None
-
-    else:
-        # Нет явной промт-команды
-        if args_without_collage:
-            override_text = args_without_collage
-            prompt_file = None
+        # выясняем системный промт / его имя
+        if use_text_override:
+            user_text = text_after_cmd
+            system_prompt = ""
+            prompt_label = "текст из сообщения"
         else:
-            prompt_file = cfg.default_prompt_file
+            if prompt_path:
+                system_prompt = read_prompt_file(prompt_path)
+                prompt_label = os.path.splitext(os.path.basename(prompt_path))[0]
+            else:
+                if not cfg.prompt_file:
+                    system_prompt = ""
+                    prompt_label = "без промта"
+                else:
+                    system_prompt = read_prompt_file(cfg.prompt_file)
+                    prompt_label = os.path.splitext(os.path.basename(cfg.prompt_file))[0]
 
-    # Определяем режим per_image (поштучно / коллаж)
-    if collage_flag:
-        per_image = False
-    else:
-        per_image = cfg.per_image_default
+        # статусное сообщение (без Markdown, чтобы промт с _ не ломал парсер)
+        def fmt_mb(n_bytes: int) -> str:
+            return f"{n_bytes / (1024.0 * 1024.0):.2f} MB"
 
-    # Случай: только текст, без картинок
-    if images_count == 0:
-        if not override_text:
-            await message.reply("Нужен либо текст, либо фото.")
-            return
+        orig_total = sum(len(b) for b in images_bytes)
+        resized_total = sum(len(b) for b in resized)
+        n_files = len(resized)
+        files_word = "файл" if n_files == 1 else "файла" if n_files < 5 else "файлов"
 
-        status = await message.reply("Принял текст, отправляю запрос модели…")
-        req = {
-            "action": "analyze",
-            "prompt_file": None,
-            "override_text": override_text,
-            "per_image": False,
-            "quiet": True,
-            "include_billing": True,
-            "images": [],
-            "overrides": {},
-        }
-        resp = handle_json_request(req)
-        if not resp.get("ok"):
-            await status.edit_text("Ошибка при обращении к модели.")
-            return
-
-        text_only = resp.get("text_only") or ""
-        await send_result_text_or_file(status, text_only, "text_analysis")
-
-        # учёт статистики
-        requests_count, tokens_used, total_cost = summarize_usage(resp)
-        user_store.add_stats(
-            user_id=user.id,
-            username=user.username,
-            images_count=0,
-            total_bytes=0,
-            requests_count=requests_count,
-            tokens_used=tokens_used,
-            total_cost=total_cost,
+        await msg.answer(
+            f"📷 Взял в работу {n_files} {files_word}. "
+            f"Размер {fmt_mb(orig_total)} → {fmt_mb(resized_total)}, "
+            f"промт {prompt_label}.",            
         )
-        return
 
-    # Тут есть картинки
-    if collage_flag:
-        mode_desc = "коллаж"
-    else:
-        mode_desc = "поштучно" if per_image else "авто/коллаж"
+        multiple = len(resized) > 1
+        per_image = PER_IMAGE_DEFAULT
+        if force_collage:
+            per_image = False
 
-    prompt_desc = prompt_file or ("override_text" if override_text else "(по умолчанию)")
+        total_bytes = resized_total
+        aggregated_texts: List[str] = []
+        total_cost_request = 0.0
 
-    status = await message.reply(
-        f"Принял {images_count} изображение(й).\n"
-        f"Режим: {mode_desc}.\n"
-        f"Промт: {prompt_desc}.\n"
-        f"Отправляю в модель…"
-    )
+        if multiple and not per_image:
+            named = [(f"image_{i+1}.jpg", b) for i, b in enumerate(resized)]
+            collage_bytes, file_names = make_collage(
+                named,
+                cfg.collage_max_size,
+                cfg.collage_quality,
+            )
+            if use_text_override:
+                collage_system_prompt = ""
+                user_text_for_call = user_text
+            else:
+                collage_system_prompt = build_collage_system_prompt(
+                    system_prompt,
+                    file_names,
+                )
+                user_text_for_call = None
 
-    req = build_analyzer_request(
-        images=images,
-        prompt_file=prompt_file,
-        override_text=override_text,
-        per_image=per_image,
-    )
+            resp = call_model_with_image(
+                cfg,
+                collage_bytes,
+                system_prompt=collage_system_prompt,
+                user_text=user_text_for_call,
+                quiet=True,
+            )
+            if isinstance(resp, tuple):
+                text_result, usage = resp
+            else:
+                text_result, usage = resp, None
 
-    # Запрос к анализатору
-    resp = handle_json_request(req)
-    if not resp.get("ok"):
-        await status.edit_text(f"Ошибка при анализе: {resp.get('error') or 'unknown error'}")
-        return
+            update_stats_after_call(
+                user_id,
+                images=len(resized),
+                bytes_sent=total_bytes,
+                usage=usage,
+            )
 
-    mode = resp.get("mode")
-    results = resp.get("results") or []
+            if usage:
+                try:
+                    total_cost_request += float(usage.get("total_cost", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    pass
 
-    # Формируем ответ пользователю
-    if mode in ("single", "collage", "image_with_text"):
-        text_out = results[0].get("text", "")
-        await send_result_text_or_file(status, text_out, "analysis")
-    elif mode == "per_image":
-        lines: List[str] = []
-        for idx, r in enumerate(results, start=1):
-            name = r.get("image_name") or f"image_{idx}"
-            text_out = r.get("text", "")
-            lines.append(f"#{idx} ({name}):\n{text_out}\n")
-        final = "\n".join(lines)
-        await send_result_text_or_file(status, final, "analysis_per_image")
-    elif mode == "text_only":
-        text_out = resp.get("text_only") or ""
-        await send_result_text_or_file(status, text_out, "analysis_text")
-    else:
-        await status.edit_text("Модель вернула неожиданный формат ответа.")
-        return
+            aggregated_texts.append(escape_md(text_result))
+        else:
+            for i, jpeg in enumerate(resized, start=1):
+                if use_text_override:
+                    system_prompt_for_call = ""
+                    user_text_for_call = user_text
+                else:
+                    system_prompt_for_call = system_prompt
+                    user_text_for_call = None
+                resp = call_model_with_image(
+                    cfg,
+                    jpeg,
+                    system_prompt=system_prompt_for_call,
+                    user_text=user_text_for_call,
+                    quiet=True,
+                )
+                if isinstance(resp, tuple):
+                    text_result, usage = resp
+                else:
+                    text_result, usage = resp, None
 
-    # Статистика
-    total_bytes = sum(size for (_, _, size) in images)
-    requests_count, tokens_used, total_cost = summarize_usage(resp)
-    user_store.add_stats(
-        user_id=user.id,
-        username=user.username,
-        images_count=images_count,
-        total_bytes=total_bytes,
-        requests_count=requests_count,
-        tokens_used=tokens_used,
-        total_cost=total_cost,
-    )
+                update_stats_after_call(
+                    user_id,
+                    images=1,
+                    bytes_sent=len(jpeg),
+                    usage=usage,
+                )
+
+                if usage:
+                    try:
+                        total_cost_request += float(
+                            usage.get("total_cost", 0.0) or 0.0
+                        )
+                    except (TypeError, ValueError):
+                        pass
+
+                header = f"*Изображение #{i}*\n"
+                aggregated_texts.append(header + escape_md(text_result))
+
+        final_text = "\n\n".join(aggregated_texts)
+        if total_cost_request > 0:
+            final_text += f"\n\n*💎 {total_cost_request:.3f} у.е.*"
+
+        await send_text_or_file(msg, final_text, filename_prefix="images")
+
+    except Exception as e:
+        await safe_error_reply(msg, e)
 
 
-# ------------------ startup / main ------------------ #
-
-async def on_startup(bot: Bot):
-    # Регистрируем команды
-    commands: List[BotCommand] = [
-        BotCommand(command="help", description="Как пользоваться ботом"),
-        BotCommand(command="text", description="Анализ по тексту без промта"),
-        BotCommand(command="howto", description="Список howto-заметок"),
-        BotCommand(command="billing", description="Показать баланс провайдера (админ)"),
-    ]
-    for name in sorted(prompts.keys()):
-        commands.append(BotCommand(command=name, description=f"Промт: {name}"))
-    await bot.set_my_commands(commands)
-    log.info("Bot commands registered: %s", [c.command for c in commands])
-
-
-async def main():
-    global cfg, user_store, prompts, howtos
-
-    cfg = load_config()
-    user_store = UserStore(cfg.users_file)
-    prompts = scan_prompts(cfg.prompts_dir)
-    howtos = scan_howto(cfg.howto_dir)
-
-    bot = Bot(token=cfg.token)
-    dp = Dispatcher()
-
-    dp.startup.register(on_startup)
-
-    dp.message.register(cmd_help, Command("help"))
-    dp.message.register(cmd_howto, Command("howto"))
-
-    dp.message.register(cmd_user_add, Command("user_add"))
-    dp.message.register(cmd_user_del, Command("user_del"))
-    dp.message.register(cmd_users, Command("users"))
-    dp.message.register(cmd_stats, Command("stats"))
-    dp.message.register(cmd_stats_reset, Command("stats_reset"))
-    dp.message.register(cmd_billing, Command("billing"))
-
-    # основной обработчик — в самом конце
-    dp.message.register(handle_any, F)
-
-    log.info("Starting bot polling...")
+async def main() -> None:
+    await setup_bot_commands()
+    print("Bot is running...")
     await dp.start_polling(bot)
 
 
