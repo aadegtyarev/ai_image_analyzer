@@ -1,11 +1,13 @@
 from aiogram.exceptions import TelegramBadRequest
 #!/usr/bin/env python3
 import asyncio
+import sys
 import os
 import json
 import traceback
 from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Optional
+from uuid import uuid4
 
 from dotenv import load_dotenv
 
@@ -23,6 +25,7 @@ from ai_image_analyzer import (
     make_collage,
     check_balance,
 )
+from typing import Dict
 
 load_dotenv()
 
@@ -316,22 +319,23 @@ def sanitize_command_name(base: str, used: set, idx: int) -> str:
     return name
 
 
-def load_prompts() -> Dict[str, PromptInfo]:
+def load_prompts(prompts_dir: Optional[str] = None) -> Dict[str, PromptInfo]:
     prompts: Dict[str, PromptInfo] = {}
-    if not os.path.isdir(PROMPTS_DIR):
+    dir_to_use = prompts_dir or os.getenv("PROMPTS_DIR", PROMPTS_DIR)
+    if not os.path.isdir(dir_to_use):
         return prompts
 
     used_commands: set = set()
     idx = 1
 
-    for fname in sorted(os.listdir(PROMPTS_DIR)):
+    for fname in sorted(os.listdir(dir_to_use)):
         if not fname.lower().endswith(".txt"):
             continue
         base = os.path.splitext(fname)[0]
         cmd = sanitize_command_name(base, used_commands, idx)
         idx += 1
 
-        path = os.path.join(PROMPTS_DIR, fname)
+        path = os.path.join(dir_to_use, fname)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 first_line = f.readline().strip()
@@ -348,6 +352,49 @@ def load_prompts() -> Dict[str, PromptInfo]:
 
 
 PROMPTS: Dict[str, PromptInfo] = load_prompts()
+import time
+
+# Temporary cache for media group prompts: media_group_id -> {system_prompt, prompt_label, use_text_override, user_text, ts}
+MEDIA_CONTEXTS: Dict[str, dict] = {}
+MEDIA_CONTEXT_TTL = int(os.getenv("MEDIA_CONTEXT_TTL", "120"))
+
+
+def _cleanup_media_contexts() -> None:
+    now = time.time()
+    to_delete = [k for k, v in MEDIA_CONTEXTS.items() if now - v.get("ts", 0) > MEDIA_CONTEXT_TTL]
+    for k in to_delete:
+        MEDIA_CONTEXTS.pop(k, None)
+        try:
+            env_dbg = os.environ.get("DEBUG", None)
+            if env_dbg is None:
+                env_dbg = os.environ.get("IMAGE_DEBUG", "")
+            media_debug = str(env_dbg).lower() in ("1", "true", "yes")
+        except Exception:
+            media_debug = False
+        if media_debug:
+            print(f"[MEDIA_DEBUG] expired media context {k}", file=sys.stderr)
+
+
+def get_media_context(media_group_id: Optional[str]) -> Optional[dict]:
+    if not media_group_id:
+        return None
+    _cleanup_media_contexts()
+    return MEDIA_CONTEXTS.get(media_group_id)
+
+
+def set_media_context(media_group_id: str, ctx: dict) -> None:
+    ctx = dict(ctx)
+    ctx["ts"] = time.time()
+    MEDIA_CONTEXTS[media_group_id] = ctx
+    try:
+        env_dbg = os.environ.get("DEBUG", None)
+        if env_dbg is None:
+            env_dbg = os.environ.get("IMAGE_DEBUG", "")
+        media_debug = str(env_dbg).lower() in ("1", "true", "yes")
+    except Exception:
+        media_debug = False
+    if media_debug:
+        print(f"[MEDIA_DEBUG] set media context {media_group_id}: prompt_label={ctx.get('prompt_label')}", file=sys.stderr)
 
 
 async def setup_bot_commands() -> None:
@@ -368,6 +415,9 @@ async def setup_bot_commands() -> None:
     cmds.append(BotCommand(command="help", description="Справка и список промтов"))
 
     await bot.set_my_commands(cmds[:100])
+
+
+# dump_payload_to_file is implemented in debug_utils and reads DUMP_PAYLOADS/DUMP_DIR at runtime
 
 # --- helpers ---
 
@@ -653,6 +703,20 @@ async def main_handler(msg: Message) -> None:
             await send_response(msg, f"❌ Пользователь {uid} удалён из списка.")
             return
 
+        if cmd == "reload_prompts":
+            if not is_admin(user_id):
+                return
+            try:
+                # reload prompts and re-register commands
+                global PROMPTS
+                PROMPTS = load_prompts()
+                await setup_bot_commands()
+                await send_response(msg, "✅ Prompts reloaded.")
+                print("[ADMIN] PROMPTS reloaded", file=sys.stderr)
+            except Exception as e:
+                await send_response(msg, f"Failed to reload prompts: {e}")
+            return
+
         if cmd == "stats":
             ensure_stats(user_id)
             s = users_db["stats"][str(user_id)]
@@ -767,6 +831,18 @@ async def main_handler(msg: Message) -> None:
             images_bytes.extend(await extract_images_from_message(msg.reply_to_message))
 
         text_after_cmd = tail
+        # user_text holds override text when provided; initialize to avoid UnboundLocalError
+        user_text = None
+        # per-request short ID to correlate logs
+        request_id = uuid4().hex[:8]
+        # Prompt debug flag: unified DEBUG, fallback to IMAGE_DEBUG
+        try:
+            env_dbg = os.environ.get("DEBUG", None)
+            if env_dbg is None:
+                env_dbg = os.environ.get("IMAGE_DEBUG", "")
+            prompt_debug = str(env_dbg).lower() in ("1", "true", "yes")
+        except Exception:
+            prompt_debug = False
 
         use_text_override = False
         force_collage = False
@@ -818,56 +894,144 @@ async def main_handler(msg: Message) -> None:
             return
 
         # есть изображения — сначала ресайз
-        from PIL import Image
+        from PIL import Image, ImageOps
         import io as _io
 
-        def resize_bytes(data: bytes, max_size: int, quality: int) -> bytes:
+        def resize_bytes(data: bytes, max_size: int, quality: int) -> tuple[bytes, int, int, str]:
+            # Учитываем EXIF-ориентацию и возвращаем байты + финальные размеры + ориентацию
             with Image.open(_io.BytesIO(data)) as im:
+                im = ImageOps.exif_transpose(im)
                 im = im.convert("RGB")
                 w, h = im.size
+                if h > w:
+                    orientation = "portrait"
+                elif w > h:
+                    orientation = "landscape"
+                else:
+                    orientation = "square"
                 scale = min(1.0, float(max_size) / max(w, h))
                 if scale < 1.0:
                     new_size = (int(w * scale), int(h * scale))
                     im = im.resize(new_size, Image.LANCZOS)
+                final_w, final_h = im.size
+                # Первый вариант: попытка сохранить с optimize=True
                 buf = _io.BytesIO()
-                im.save(buf, format="JPEG", quality=quality, optimize=True)
-                return buf.getvalue()
+                try:
+                    im.save(buf, format="JPEG", quality=quality, optimize=True)
+                except Exception:
+                    # Некоторые комбинации параметров/образов могут провоцировать ошибки оптимизации;
+                    # попробуем без optimize
+                    buf = _io.BytesIO()
+                    im.save(buf, format="JPEG", quality=min(quality, 95), optimize=False)
+                out = buf.getvalue()
+                # Защитный fallback: если по какой-то причине байтов нет — попробуем ещё раз без optimize
+                if not out:
+                    buf = _io.BytesIO()
+                    im.save(buf, format="JPEG", quality=min(quality, 85), optimize=False)
+                    out = buf.getvalue()
+                if not out:
+                    raise RuntimeError("resize_bytes: resulted in empty JPEG bytes")
+                return out, final_w, final_h, orientation
 
-        resized: List[bytes] = [
+        resized: List[tuple[bytes, int, int, str]] = [
             resize_bytes(b, cfg.image_max_size, cfg.image_quality)
             for b in images_bytes
         ]
 
+        # Debug output about resized images
+        try:
+            env_dbg = os.environ.get("DEBUG", None)
+            if env_dbg is None:
+                env_dbg = os.environ.get("IMAGE_DEBUG", "")
+            image_debug = str(env_dbg).lower() in ("1", "true", "yes")
+        except Exception:
+            image_debug = False
+        if image_debug:
+            for idx, (b, w, h, o) in enumerate(resized, start=1):
+                print(f"[IMAGE_DEBUG] image #{idx}: orientation={o}, size={w}x{h}, bytes={len(b)}", file=sys.stderr)
+
         # выясняем системный промт / его имя
-        if use_text_override:
-            user_text = text_after_cmd
-            system_prompt = ""
-            prompt_label = "текст из сообщения"
+        # Check for media group context first: if message is part of a media group
+        mgid = getattr(msg, "media_group_id", None)
+        cached = get_media_context(mgid) if mgid else None
+        if cached:
+            # reuse cached prompt info for this media group
+            system_prompt = cached.get("system_prompt", "")
+            prompt_label = cached.get("prompt_label", "без промта")
+            use_text_override = cached.get("use_text_override", False)
+            user_text = cached.get("user_text")
+            if prompt_debug:
+                print(f"[PROMPT_DEBUG][{request_id}] using cached media prompt for media_group_id={mgid}: prompt_label={prompt_label}", file=sys.stderr)
         else:
-            if prompt_path:
+            if use_text_override:
+                user_text = text_after_cmd
+                system_prompt = ""
+                prompt_label = "текст из сообщения"
+                if prompt_debug:
+                    print(f"[PROMPT_DEBUG][{request_id}] use_text_override -> user_text={user_text!r}", file=sys.stderr)
+            elif prompt_path:
                 system_prompt = read_prompt_file(prompt_path)
                 prompt_label = os.path.splitext(os.path.basename(prompt_path))[0]
+                if prompt_debug:
+                    print(f"[PROMPT_DEBUG][{request_id}] prompt_path={prompt_path!r}, prompt_label={prompt_label!r}, system_snip={system_prompt[:200]!r}", file=sys.stderr)
+                # If this message is part of a media group, cache the prompt info so subsequent messages reuse it
+                if mgid:
+                    set_media_context(mgid, {"system_prompt": system_prompt, "prompt_label": prompt_label, "use_text_override": use_text_override, "user_text": user_text})
             else:
                 if not cfg.prompt_file:
                     system_prompt = ""
                     prompt_label = "без промта"
+                    if prompt_debug:
+                        print(f"[PROMPT_DEBUG][{request_id}] no system prompt configured", file=sys.stderr)
                 else:
                     system_prompt = read_prompt_file(cfg.prompt_file)
                     prompt_label = os.path.splitext(os.path.basename(cfg.prompt_file))[0]
+                    if prompt_debug:
+                        print(f"[PROMPT_DEBUG][{request_id}] cfg.prompt_file={cfg.prompt_file!r}, prompt_label={prompt_label!r}, system_snip={system_prompt[:200]!r}", file=sys.stderr)
+                    if mgid:
+                        set_media_context(mgid, {"system_prompt": system_prompt, "prompt_label": prompt_label, "use_text_override": use_text_override, "user_text": user_text})
+
+                # If debug enabled, print a short sanitized payload summary to stderr for easier tracing
+                try:
+                    if prompt_debug:
+                        sp = {
+                            "request_id": request_id,
+                            "prompt_label": prompt_label,
+                            "system_snip": (system_prompt or "")[:200],
+                            "user_snip": (text_after_cmd or "")[:200],
+                            "images": [{"idx": i + 1, "len": len(b)} for i, b in enumerate(images_bytes)],
+                        }
+                        print(f"[PROMPT_DEBUG][{request_id}] payload_summary: {sp}", file=sys.stderr)
+                except Exception:
+                    print(f"[PROMPT_DEBUG][{request_id}] failed to build payload summary", file=sys.stderr)
 
         # статусное сообщение (без Markdown, чтобы промт с _ не ломал парсер)
         def fmt_mb(n_bytes: int) -> str:
             return f"{n_bytes / (1024.0 * 1024.0):.2f} MB"
 
         orig_total = sum(len(b) for b in images_bytes)
-        resized_total = sum(len(b) for b in resized)
+        # resized is list of tuples (bytes, w, h, orientation)
+        resized_total = sum(len(b) for b, *_ in resized)
+        # If resized_total unexpectedly zero while orig_total > 0, log diagnostics
+        if resized_total == 0 and orig_total > 0:
+            print("[IMAGE_DEBUG] Warning: resized_total==0 while orig_total>0", file=sys.stderr)
+            for idx, item in enumerate(resized, start=1):
+                try:
+                    b = item[0]
+                    print(f"[IMAGE_DEBUG] resized #{idx}: type={type(b)!r}, len={len(b)}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[IMAGE_DEBUG] resized #{idx}: failed to inspect: {e}", file=sys.stderr)
         n_files = len(resized)
         files_word = "файл" if n_files == 1 else "файла" if n_files < 5 else "файлов"
+
+        status_suffix = ""
+        if resized_total == 0 and orig_total > 0:
+            status_suffix = " ⚠️ (ошибка при ресайзе; смотрите логи)"
 
         await send_response(
             msg,
             f"📷 Взял в работу {n_files} {files_word}. "
-            f"Размер {fmt_mb(orig_total)} → {fmt_mb(resized_total)}, "
+            f"Размер {fmt_mb(orig_total)} → {fmt_mb(resized_total)},{status_suffix} "
             f"промт {prompt_label}."
         )
 
@@ -881,7 +1045,7 @@ async def main_handler(msg: Message) -> None:
         total_cost_request = 0.0
 
         if multiple and not per_image:
-            named = [(f"image_{i+1}.jpg", b) for i, b in enumerate(resized)]
+            named = [(f"image_{i+1}.jpg", b) for i, (b, w, h, o) in enumerate(resized)]
             collage_bytes, file_names = make_collage(
                 named,
                 cfg.collage_max_size,
@@ -897,12 +1061,18 @@ async def main_handler(msg: Message) -> None:
                 )
                 user_text_for_call = None
 
+            collage_meta = {"mode": "collage", "orientations": {f: o for f, o in zip(file_names, [orient for _, _, orient, _ in resized])}}
+            if image_debug:
+                print(f"[IMAGE_DEBUG] calling model for collage; files={file_names}; meta={collage_meta}; collage_bytes={len(collage_bytes)}", file=sys.stderr)
+            if prompt_debug:
+                print(f"[PROMPT_DEBUG][{request_id}] calling model for COLLAGE; prompt_label={prompt_label!r}, system_snip={collage_system_prompt[:200]!r}, user_text_snip={user_text_for_call[:200]!r}", file=sys.stderr)
             resp = call_model_with_image(
                 cfg,
                 collage_bytes,
                 system_prompt=collage_system_prompt,
                 user_text=user_text_for_call,
                 quiet=True,
+                image_meta=collage_meta,
             )
             if isinstance(resp, tuple):
                 text_result, usage = resp
@@ -922,21 +1092,28 @@ async def main_handler(msg: Message) -> None:
                 except (TypeError, ValueError):
                     pass
 
-            aggregated_texts.append(text_result)
+            header = f"Коллаж — промт: {prompt_label}\n"
+            aggregated_texts.append(header + text_result)
         else:
-            for i, jpeg in enumerate(resized, start=1):
+            for i, (jpeg, final_w, final_h, orientation) in enumerate(resized, start=1):
                 if use_text_override:
                     system_prompt_for_call = ""
                     user_text_for_call = user_text
                 else:
                     system_prompt_for_call = system_prompt
                     user_text_for_call = None
+                image_meta = {"orientation": orientation, "width": final_w, "height": final_h}
+                if image_debug:
+                    print(f"[IMAGE_DEBUG] calling model for image #{i}; meta={image_meta}; bytes={len(jpeg)}", file=sys.stderr)
+                if prompt_debug:
+                    print(f"[PROMPT_DEBUG][{request_id}] calling model for image #{i}; prompt_label={prompt_label!r}, system_snip={(system_prompt_for_call or '')[:200]!r}, user_text_snip={str(user_text_for_call or '')[:200]!r}", file=sys.stderr)
                 resp = call_model_with_image(
                     cfg,
                     jpeg,
                     system_prompt=system_prompt_for_call,
                     user_text=user_text_for_call,
                     quiet=True,
+                    image_meta=image_meta,
                 )
                 if isinstance(resp, tuple):
                     text_result, usage = resp
@@ -958,7 +1135,7 @@ async def main_handler(msg: Message) -> None:
                     except (TypeError, ValueError):
                         pass
 
-                header = f"Изображение #{i}\n"
+                header = f"Изображение #{i} — промт: {prompt_label}\n"
                 aggregated_texts.append(header + text_result)
 
         final_text = "\n\n".join(aggregated_texts)

@@ -24,7 +24,9 @@ def test_defaults():
 
 def test_analyze_json_missing_api_key():
     from ai_image_analyzer import handle_json_request
-
+    import os
+    # ensure no OPENAI_API_KEY in environment for this test
+    os.environ.pop("OPENAI_API_KEY", None)
     req = {"action": "analyze", "images": []}
     resp = handle_json_request(req)
     assert resp["ok"] is False

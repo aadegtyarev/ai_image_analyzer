@@ -30,7 +30,7 @@ from datetime import datetime
 from typing import Any, List, Optional, Sequence, Tuple
 
 import requests
-from PIL import Image  # pillow
+from PIL import Image, ImageOps  # pillow
 try:
     from dotenv import load_dotenv  # type: ignore
 except ImportError:  # dotenv is optional
@@ -63,6 +63,7 @@ class Config:
     collage_max_size: int
     collage_quality: int
     prompt_file: Optional[str]
+    image_debug: bool = False
 
 
 def load_config() -> Config:
@@ -93,6 +94,11 @@ def load_config() -> Config:
     collage_quality = _int_env("COLLAGE_QUALITY", 90)
 
     prompt_file = os.environ.get("PROMPT_FILE")
+    # Unified debug flag: check DEBUG first, fall back to IMAGE_DEBUG for backward compatibility
+    image_debug_env = os.environ.get("DEBUG", None)
+    if image_debug_env is None:
+        image_debug_env = os.environ.get("IMAGE_DEBUG", "")
+    image_debug = str(image_debug_env).lower() in ("1", "true", "yes")
 
     return Config(
         api_key=api_key,
@@ -105,6 +111,7 @@ def load_config() -> Config:
         collage_max_size=collage_max_size,
         collage_quality=collage_quality,
         prompt_file=prompt_file,
+        image_debug=image_debug,
     )
 
 
@@ -116,6 +123,63 @@ def read_prompt_file(path: Optional[str]) -> str:
             return f.read().strip()
     except OSError as e:
         sys.exit(f"ERROR: failed to read PROMPT_FILE={path!r}: {e}")
+
+
+def load_config_from_env(env: dict):
+    """Backward-compatible loader used by tests.
+
+    Returns a simple object with attributes `context_size`, `max_tokens`, and `x_title`.
+    """
+    class SimpleCfg:
+        pass
+
+    cfg = SimpleCfg()
+    try:
+        context_size = int(env.get("OPENAI_CONTEXT_SIZE", 2048))
+    except Exception:
+        context_size = 2048
+    try:
+        max_tokens = int(env.get("OPENAI_MAX_TOKENS", 1024))
+    except Exception:
+        max_tokens = 1024
+    # cap max_tokens to context_size - 1
+    if max_tokens > max(0, context_size - 1):
+        max_tokens = max(0, context_size - 1)
+    cfg.context_size = context_size
+    cfg.max_tokens = max_tokens
+    cfg.x_title = env.get("OPENAI_X_TITLE")
+    return cfg
+
+
+def handle_json_request(req: dict) -> dict:
+    """Minimal JSON API handler for tests and integrations.
+
+    Supports action 'analyze' with optional 'override_text' and 'include_billing'.
+    """
+    # basic validation: if there's no override_text we need an API key
+    if req.get("override_text") is None and not os.environ.get("OPENAI_API_KEY"):
+        return {"ok": False, "errors": ["OPENAI_API_KEY is not set"]}
+
+    action = req.get("action")
+    if action != "analyze":
+        return {"ok": False, "errors": ["unsupported action"]}
+
+    override_text = req.get("override_text")
+    include_billing = bool(req.get("include_billing", False))
+
+    if override_text is not None:
+        # call text-only path
+        try:
+            result, usage = call_model_with_text_only(load_config(), override_text, system_prompt="", quiet=True)
+        except Exception as e:
+            return {"ok": False, "errors": [str(e)]}
+        resp = {"ok": True, "results": result}
+        if include_billing:
+            resp["usage"] = usage
+        return resp
+
+    # For now, other modes are not implemented in tests
+    return {"ok": False, "errors": ["no override_text provided"]}
 
 
 # ---------------------------------------------------------------------------
@@ -148,23 +212,34 @@ def expand_image_patterns(patterns: Sequence[str]) -> List[str]:
     return uniq
 
 
-def load_and_resize_image(path: str, max_size: int, jpeg_quality: int) -> bytes:
+def load_and_resize_image(path: str, max_size: int, jpeg_quality: int) -> tuple[bytes, int, int, str]:
     """
     Открыть картинку, привести по меньшей стороне к max_size,
     сохранить в JPEG с качеством jpeg_quality и вернуть байты.
     """
     try:
         with Image.open(path) as img:
+            # Учитываем EXIF-ориентацию (поворачиваем изображение к корректному отображению)
+            img = ImageOps.exif_transpose(img)
             img = img.convert("RGB")
             w, h = img.size
+            # Ориентация
+            if h > w:
+                orientation = "portrait"
+            elif w > h:
+                orientation = "landscape"
+            else:
+                orientation = "square"
             scale = min(max_size / max(w, h), 1.0)
             if scale < 1.0:
                 new_w = int(w * scale)
                 new_h = int(h * scale)
                 img = img.resize((new_w, new_h), Image.LANCZOS)
+            # Сохраняем итоговые размеры (после ресайза)
+            final_w, final_h = img.size
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
-            return buf.getvalue()
+            return buf.getvalue(), final_w, final_h, orientation
     except Exception as e:
         raise RuntimeError(f"Failed to load/resize image {path!r}: {e}") from e
 
@@ -323,6 +398,7 @@ def call_model_with_image(
     system_prompt: str,
     user_text: Optional[str],
     quiet: bool,
+    image_meta: Optional[dict] = None,
 ) -> Tuple[str, Optional[dict]]:
     """
     Вызов модели с одной картинкой (или коллажем).
@@ -334,12 +410,72 @@ def call_model_with_image(
     content: List[dict] = []
     if user_text:
         content.append({"type": "text", "text": user_text})
+    # Добавляем мета-информацию об изображении (ориентация, размеры и т.д.)
+    if image_meta:
+        try:
+            if image_meta.get("mode") == "collage":
+                # кратко опишем ориентации
+                orients = image_meta.get("orientations", {})
+                meta_parts = [f"{name} — {orient}" for name, orient in orients.items()]
+                meta_text = (
+                    "Примечание для модели: это коллаж. Ориентации по файлам: "
+                    + ", ".join(meta_parts)
+                    + ". Учитывайте ориентацию при анализе изображения."
+                )
+            else:
+                meta_text = (
+                    "Примечание для модели: ориентация изображения — "
+                    f"{image_meta.get('orientation')}; размер: {image_meta.get('width')}×{image_meta.get('height')}. "
+                    "Пожалуйста, учитывайте ориентацию при интерпретации сцены (например, объект может стоять, а не лежать)."
+                )
+        except Exception:
+            meta_text = "Инфо об изображении: (unknown)"
+        content.append({"type": "text", "text": meta_text})
+        # debug printing controlled by env var IMAGE_DEBUG
+        debug_on = getattr(cfg, "image_debug", False)
+        if debug_on:
+            print(f"[IMAGE_DEBUG] meta_text: {meta_text}", file=sys.stderr)
+            # print a snippet of the image_url (length) to avoid huge dumps
+            print(f"[IMAGE_DEBUG] image_url (len): {len(image_url)}", file=sys.stderr)
     content.append({"type": "image_url", "image_url": {"url": image_url}})
 
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": content})
+
+    # Prompt debug: respect unified DEBUG or fallback to IMAGE_DEBUG
+    try:
+        env_dbg = os.environ.get("DEBUG", None)
+        if env_dbg is None:
+            env_dbg = os.environ.get("IMAGE_DEBUG", "")
+        prompt_debug = str(env_dbg).lower() in ("1", "true", "yes")
+    except Exception:
+        prompt_debug = False
+    if prompt_debug:
+        try:
+            sys_snip = (system_prompt or "")[:200]
+            usr_snip = (user_text or "")[:200]
+            print(f"[PROMPT_DEBUG] system_snip={sys_snip!r} user_snip={usr_snip!r}", file=sys.stderr)
+            # reuse existing sanitizer to show messages payload
+            def _san(m):
+                if isinstance(m.get("content"), list):
+                    parts = []
+                    for c in m["content"]:
+                        t = c.get("type")
+                        if t == "image_url":
+                            url = c.get("image_url", {}).get("url", "")
+                            parts.append({"type": "image_url", "len": len(url)})
+                        else:
+                            txt = c.get("text") or ""
+                            parts.append({"type": t, "text_snip": txt[:200]})
+                    return {"role": m.get("role"), "content": parts}
+                return m
+
+            s_msgs = [(_san(m)) for m in messages]
+            print(f"[PROMPT_DEBUG] messages payload: {json.dumps(s_msgs, ensure_ascii=False)}", file=sys.stderr)
+        except Exception:
+            print("[PROMPT_DEBUG] failed to serialize messages payload", file=sys.stderr)
 
     log(
         f"Запрос к модели (image): model={cfg.model}, "
@@ -368,6 +504,29 @@ def call_model_with_image(
             return explanation, None
         log(f"BadRequestError от модели: {msg}", quiet)
         raise
+
+    # Доп. отладочная печать: показать сокращённый messages, если включён IMAGE_DEBUG
+    debug_on = getattr(cfg, "image_debug", False)
+    if debug_on:
+        def sanitize_message(m):
+            if isinstance(m.get("content"), list):
+                parts = []
+                for c in m["content"]:
+                    t = c.get("type")
+                    if t == "image_url":
+                        url = c.get("image_url", {}).get("url", "")
+                        parts.append({"type": "image_url", "len": len(url)})
+                    else:
+                        txt = c.get("text") or ""
+                        parts.append({"type": t, "text_snip": txt[:200]})
+                return {"role": m.get("role"), "content": parts}
+            return m
+
+        try:
+            s_msgs = [sanitize_message(m) for m in messages]
+            print(f"[IMAGE_DEBUG] messages payload: {json.dumps(s_msgs, ensure_ascii=False)}", file=sys.stderr)
+        except Exception:
+            print("[IMAGE_DEBUG] failed to serialize messages payload", file=sys.stderr)
 
     text = resp.choices[0].message.content or ""
     usage = normalize_usage_for_api(getattr(resp, "usage", None))
@@ -556,6 +715,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Check provider balance (if supported) and exit.",
     )
     parser.add_argument(
+        "--image-debug",
+        dest="image_debug",
+        action="store_true",
+        help="Enable image debug output to stderr (overrides IMAGE_DEBUG env).",
+    )
+    parser.add_argument(
+        "--debug",
+        dest="image_debug",
+        action="store_true",
+        help="Enable image debug output to stderr (alias for --image-debug).",
+    )
+    parser.add_argument(
         "-q",
         "--quiet",
         action="store_true",
@@ -589,6 +760,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         cfg.collage_max_size = args.collage_max_size
     if getattr(args, "collage_quality", None) is not None:
         cfg.collage_quality = args.collage_quality
+    if getattr(args, "image_debug", False):
+        cfg.image_debug = True
 
     # init logs
     log("Инициализация...", args.quiet)
@@ -645,14 +818,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         log(f"Ограничиваем количество файлов до 10 (из {len(image_paths)})", args.quiet)
         image_paths = image_paths[:10]
 
-    resized: List[Tuple[str, bytes]] = []
+    resized: List[Tuple[str, bytes, str, tuple]] = []  # path, bytes, orientation, (w,h)
     for p in image_paths:
         try:
-            jpeg_bytes = load_and_resize_image(p, cfg.image_max_size, cfg.image_quality)
+            jpeg_bytes, final_w, final_h, orientation = load_and_resize_image(
+                p, cfg.image_max_size, cfg.image_quality
+            )
         except RuntimeError as e:
             log(str(e), args.quiet)
             continue
-        resized.append((p, jpeg_bytes))
+        resized.append((p, jpeg_bytes, orientation, (final_w, final_h)))
 
     if not resized:
         print("No valid images after resize step.", file=sys.stderr)
@@ -661,18 +836,29 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     # Override-text mode (no system prompt)
     if override_text:
         if len(resized) == 1:
-            _, jpeg_bytes = resized[0]
+            _, jpeg_bytes, orientation, (final_w, final_h) = resized[0]
             log("Режим: одна картинка + override текст", args.quiet)
         else:
             log("Режим: несколько картинок + override текст → создаём коллаж", args.quiet)
-            collage_bytes, _ = make_collage(resized, cfg.collage_max_size, cfg.collage_quality)
+            collage_bytes, _ = make_collage(
+                [(p, b) for p, b, *_ in resized], cfg.collage_max_size, cfg.collage_quality
+            )
             jpeg_bytes = collage_bytes
+        # Передадим image_meta для лучшей интерпретации (ориентация/размеры)
+        if len(resized) == 1:
+            image_meta = {"orientation": orientation, "width": final_w, "height": final_h}
+        else:
+            # для коллажа соберём ориентации
+            orientations = {os.path.basename(p): o for p, _, o, _ in resized}
+            image_meta = {"mode": "collage", "orientations": orientations}
+
         result, usage = call_model_with_image(
             cfg,
             jpeg_bytes,
             system_prompt="",
             user_text=override_text,
             quiet=args.quiet,
+            image_meta=image_meta,
         )
         print(result)
         return
@@ -682,14 +868,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     log(f"Системный промт загружен, длина={len(system_prompt)}", args.quiet)
 
     if len(resized) == 1:
-        img_path, jpeg_bytes = resized[0]
+        img_path, jpeg_bytes, orientation, (final_w, final_h) = resized[0]
         log("Режим: одна картинка, без override-текста", args.quiet)
+        # Передаём метаданные изображения модели
+        image_meta = {"orientation": orientation, "width": final_w, "height": final_h}
         result, usage = call_model_with_image(
             cfg,
             jpeg_bytes,
             system_prompt=system_prompt,
             user_text=None,
             quiet=args.quiet,
+            image_meta=image_meta,
         )
         out_path = save_result_for_single_image(img_path, result)
         # Поведение stdout как раньше
@@ -697,7 +886,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     else:
         log("Режим: несколько картинок → создаём коллаж", args.quiet)
         collage_bytes, filenames = make_collage(
-            resized,
+            [(p, b) for p, b, *_ in resized],
             cfg.collage_max_size,
             cfg.collage_quality,
         )
@@ -706,12 +895,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             f"Коллаж готов, файлов в описании: {len(filenames)}",
             args.quiet,
         )
+        # собираем мета-информацию по ориентации для всех изображений
+        orientations = {os.path.basename(p): o for p, _, o, _ in resized}
+        image_meta = {"mode": "collage", "orientations": orientations}
         result, usage = call_model_with_image(
             cfg,
             collage_bytes,
             system_prompt=collage_system_prompt,
             user_text=None,
             quiet=args.quiet,
+            image_meta=image_meta,
         )
         original_paths = [p for p, _ in resized]
         out_path = save_result_for_group(original_paths, result)
