@@ -34,10 +34,25 @@ Notes:
 
 2. Copy repository to server (or `git clone`), place a secure `.env` with secrets.
 
-3. Build and start:
+3. Build and start (or use the install script below):
 
    docker compose build
    docker compose up -d
+
+### Install as a service (automated)
+
+If you'd like a systemd-managed service (recommended on single-server deployments), use the provided installer script which sets up a venv, installs dependencies, creates `.env` (if missing), and installs a systemd unit:
+
+```bash
+sudo ./deploy/install-as-service.sh --install-dir /home/$USER/applications/ai_image_analyzer --user $USER
+```
+
+After that, check status and logs:
+
+```bash
+sudo systemctl status ai_image_analyzer
+sudo journalctl -u ai_image_analyzer -f
+```
 
 ### Uninstall Docker (if you prefer to run the app directly)
 
