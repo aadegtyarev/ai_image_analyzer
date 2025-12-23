@@ -510,7 +510,8 @@ async def _process_media_group(mgid: str, cfg) -> None:
                         pass
 
                 header = f"Коллаж — промт: {prompt_label}\n"
-                aggregated_texts.append(header + text_result)
+                # ensure blank line between header and body
+                aggregated_texts.append(header + "\n" + text_result)
                 final_text = "\n\n".join(aggregated_texts)
                 if total_cost_request > 0:
                     final_text += f"\n\n💎 {total_cost_request:.3f} у.е."
@@ -613,7 +614,8 @@ async def _process_media_group(mgid: str, cfg) -> None:
                             pass
 
                     header = f"Изображение #{i} — промт: {prompt_label}\n"
-                    aggregated_texts.append(header + text_result)
+                    # add extra newline to avoid merging header and body
+                    aggregated_texts.append(header + "\n" + text_result)
                 except Exception as e:
                     print(f"[MEDIA_DEBUG] failed image #{i} in media_group {mgid}: {e}", file=sys.stderr)
 
