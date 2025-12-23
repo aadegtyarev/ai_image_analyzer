@@ -404,12 +404,7 @@ async def setup_bot_commands() -> None:
     cmds: List[BotCommand] = []
 
     cmds.append(BotCommand(command="text", description="Текст вместо промта (для фото)"))
-    cmds.append(
-        BotCommand(
-            command="text_collage",
-            description="Текст + коллаж для нескольких фото",
-        )
-    )
+        # note: 'group' flag can be passed as parameter to any command to request collage behaviour
     cmds.append(BotCommand(command="howto", description="Список howto-заметок"))
     cmds.append(BotCommand(command="stats", description="Статистика по запросам"))
     cmds.append(BotCommand(command="help", description="Справка и список промтов"))
@@ -440,6 +435,18 @@ def extract_command_and_text(msg: Message) -> Tuple[Optional[str], str]:
         cmd = cmd.split("@", 1)[0]
     tail = rest[0].strip() if rest else ""
     return cmd, tail
+
+
+def parse_tail_flags(t: str) -> Tuple[str, bool]:
+    """Parse supported flags from the tail text.
+
+    Currently supports the 'group' flag which requests collage mode.
+    Returns (cleaned_tail, force_collage_bool)
+    """
+    parts = [p for p in (t or "").split() if p]
+    flags = set(p.lower() for p in parts if p.lower() == "group")
+    cleaned = " ".join(p for p in parts if p.lower() not in flags)
+    return cleaned, ("group" in flags)
 
 
 def normalize_command(cmd: Optional[str]) -> Optional[str]:
@@ -842,6 +849,8 @@ async def main_handler(msg: Message) -> None:
         text_after_cmd = tail
         # user_text holds override text when provided; initialize to avoid UnboundLocalError
         user_text = None
+        # parse flags from tail (e.g., 'group' to force collage)
+        text_after_cmd, flag_group = parse_tail_flags(text_after_cmd or "")
         # per-request short ID to correlate logs
         request_id = uuid4().hex[:8]
         # Prompt debug flag: unified DEBUG, fallback to IMAGE_DEBUG
@@ -857,13 +866,18 @@ async def main_handler(msg: Message) -> None:
         force_collage = False
         prompt_path: Optional[str] = None
 
-        if cmd in ("text", "text_collage"):
+        if cmd == "text":
             use_text_override = True
-            force_collage = cmd == "text_collage"
+            # force_collage if 'group' flag passed
+            if flag_group:
+                force_collage = True
         elif cmd in PROMPTS:
             prompt_path = PROMPTS[cmd].path
+            # if there is remaining text, use it to override prompt; also check for group flag
             if text_after_cmd:
                 use_text_override = True
+            if flag_group:
+                force_collage = True
         else:
             if text_after_cmd:
                 use_text_override = True

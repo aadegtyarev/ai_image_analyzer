@@ -440,6 +440,13 @@ Bot is running...
  - `IMAGE_DEBUG=1` — печатает мета-информацию по изображениям (`[IMAGE_DEBUG] image #...`).
  - При включённом `DEBUG=1` также выводятся сообщения о кэшировании промта для альбомов: `[MEDIA_DEBUG] set media context <media_group_id>:` и при истечении кэша: `[MEDIA_DEBUG] expired media context <media_group_id>`.
 
+New: use `group` flag to request collage behavior for any command.
+
+Examples:
+
+* `/art group` — for the `art` prompt, build a collage of images and send a single request.
+* `/text group` — send a text override and request a collage instead of per-image requests.
+
 Пример запуска для детальной диагностики:
 
 ```bash
