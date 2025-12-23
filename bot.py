@@ -441,7 +441,7 @@ async def send_howto_list(msg: Message) -> None:
         return
     lines = ["📚 Доступные howto:"]
     for name in sorted(files):
-        lines.append(f"/howto {name}")
+        lines.append(f"`/howto {name}`")
     await send_response(msg, "\n".join(lines))
 
 
@@ -474,7 +474,7 @@ async def handle_help(msg: Message) -> None:
     if PROMPTS:
         for cmd, p in sorted(PROMPTS.items()):
             desc = p.description or ""
-            line = f"`/{cmd} - {desc}`"
+            line = f"`/{cmd}` - {desc}"
             lines.append(line)
     else:
         lines.append("(папка PROMPTS_DIR пуста)")
