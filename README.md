@@ -193,6 +193,12 @@ prompts/
 DEBUG=1 IMAGE_DEBUG=1 python bot.py
 ```
 
+Docker (basic):
+
+```bash
+docker compose up --build -d
+```
+
 ```
 ::contentReference[oaicite:1]{index=1}
 ```

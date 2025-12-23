@@ -30,7 +30,6 @@
 
 ---
 
-## 🚀 Базовое использование
 
 ### ▶ Отправить одно фото
 
@@ -45,8 +44,26 @@
 ---
 
 ### ▶ Отправить несколько фото
-
 Можно:
+## Docker
+
+You can run the bot in Docker using the provided `Dockerfile` and `docker-compose.yml`.
+
+Basic usage:
+
+```bash
+docker compose up --build -d
+```
+
+Run in debug mode (local development):
+
+```bash
+DEBUG=1 IMAGE_DEBUG=1 docker compose up --build
+```
+
+Notes:
+- `prompts/` and `howto/` are mounted read-only into the container; `db/` is mounted for persistent user data.
+- Configure secrets via `.env` (do not commit it to git).
 
 * прислать сразу несколько файлов в одном сообщении
 * переслать альбом

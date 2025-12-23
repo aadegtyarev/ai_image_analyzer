@@ -1,0 +1,21 @@
+version: "3.8"
+services:
+  bot:
+    build: .
+    image: ai_image_analyzer:latest
+    container_name: ai_image_analyzer_bot
+    env_file:
+      - .env
+    volumes:
+      - ./prompts:/app/prompts:ro
+      - ./howto:/app/howto:ro
+      - ./db:/app/db
+    restart: unless-stopped
+    environment:
+      - DEBUG=0
+    command: python bot.py
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'python bot.py' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
