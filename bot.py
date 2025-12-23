@@ -1,3 +1,4 @@
+from aiogram.exceptions import TelegramBadRequest
 #!/usr/bin/env python3
 import asyncio
 import os
@@ -137,6 +138,74 @@ def set_user_meta(uid: int, description: str, username: str = "", full_name: str
     save_users(users_db)
 
 
+
+# --- Markdown → HTML для Telegram ---
+import re
+FORMAT_MODE = 'HTML'  # 'HTML' для теста, None — plain text
+
+def simple_markdown_to_html(md: str) -> str:
+    def esc(s):
+        return (
+            s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+        )
+
+    # --- 1. Вырезаем code и ссылки, заменяя на плейсхолдеры, до любых замен ---
+    code_placeholders = []
+    link_placeholders = []
+
+    def code_repl(m):
+        # Сохраняем исходный текст кода (без экранирования и замен!)
+        code_placeholders.append(m.group(1))
+        return f"{{{{CODE{len(code_placeholders)-1}}}}}"
+
+    def link_repl(m):
+        # Сохраняем исходный текст ссылки (без экранирования и замен!)
+        link_placeholders.append((m.group(1), m.group(2)))
+        return f"{{{{LINK{len(link_placeholders)-1}}}}}"
+
+    # Сначала вырезаем code и ссылки из исходного md
+    md_wo_code = re.sub(r"`([^`]+?)`", code_repl, md)
+    md_wo_code_links = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", link_repl, md_wo_code)
+
+    html = esc(md_wo_code_links)
+
+    # --- 2. Применяем остальную разметку ---
+    # Заголовки # ... => <b>...</b>
+    html = re.sub(r"^# (.+)$", r"<b>\1</b>", html, flags=re.MULTILINE)
+    html = re.sub(r"^## (.+)$", r"<b>\1</b>", html, flags=re.MULTILINE)
+    html = re.sub(r"^### (.+)$", r"<b>\1</b>", html, flags=re.MULTILINE)
+    # Жирный **...** или __...__ — только не внутри слова
+    html = re.sub(r"(?<!\w)\*\*(.+?)\*\*(?!\w)", r"<b>\1</b>", html)
+    html = re.sub(r"(?<!\w)__(.+?)__(?!\w)", r"<b>\1</b>", html)
+    # Курсив *...* или _..._ — только не внутри слова
+    html = re.sub(r"(?<!\w)\*(.+?)\*(?!\w)", r"<i>\1</i>", html)
+    html = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"<i>\1</i>", html)
+    # Маркированные списки
+    html = re.sub(r"^\* (.+)$", r"• \1", html, flags=re.MULTILINE)
+
+    # Нормализуем переносы строк: ограничиваем серии переносов и удаляем ведущие переносы
+    html = re.sub(r'\n{3,}', '\n\n', html)
+    html = re.sub(r'^\n+', '', html)
+    # Убираем переносы перед HTML-тегами (например, "\n<code>")
+    html = re.sub(r'\n+(<)', r'\1', html)
+
+    # --- 3. Возвращаем плейсхолдеры обратно ---
+    for i, (text, url) in enumerate(link_placeholders):
+        # Внутри ссылок Telegram разрешает только текст, без вложенных тегов
+        safe_text = esc(text)
+        html = html.replace(f"{{{{LINK{i}}}}}", f'<a href="{url}">{safe_text}</a>')
+    for i, code in enumerate(code_placeholders):
+        # Внутри <code>...</code> запрещены вложенные теги и <br>
+        safe_code = esc(code).replace('<br>', '\n')
+        html = html.replace(f"{{{{CODE{i}}}}}", f'<code>{safe_code}</code>')
+
+    # Убираем все <br>, стоящие сразу после первой строки (Telegram не любит <br> в начале)
+    html = re.sub(r'^(.*?)(?:<br>)+', r'\1', html, count=1)
+
+    return html
+
 # --- централизованная отправка сообщений ---
 async def send_response(
     msg: Message,
@@ -145,19 +214,54 @@ async def send_response(
     filename_prefix: str = "response",
 ) -> None:
     """
-    Унифицированная отправка текста или файла в Telegram (plain text).
+    Унифицированная отправка текста или файла в Telegram.
     text: строка для отправки (если есть)
     file_path: путь к файлу для отправки (если есть)
+    FORMAT_MODE: None — plain text, 'HTML' — markdown→html
     """
     if text:
-        if len(text) <= 3800:
-            await msg.answer(text)
+        if FORMAT_MODE == 'HTML':
+            html = simple_markdown_to_html(text)
+            if len(html) <= 3800:
+                try:
+                    await msg.answer(html, parse_mode='HTML')
+                    return
+                except TelegramBadRequest as e:
+                    if "can't parse entities" in str(e):
+                        # Логируем ошибку парсера Telegram и показываем контекст байтов вокруг проблемы
+                        err_text = str(e)
+                        print(f"[TelegramBadRequest] can't parse entities: {err_text}", flush=True)
+                        print(f"Исходный текст: {repr(text)}", flush=True)
+                        print(f"HTML: {repr(html)}", flush=True)
+                        m = re.search(r'byte offset (\d+)', err_text)
+                        if m:
+                            off = int(m.group(1))
+                            b = html.encode('utf-8')
+                            start = max(0, off - 40)
+                            end = min(len(b), off + 40)
+                            context_bytes = b[start:end]
+                            print(f"Problem byte offset: {off}", flush=True)
+                            print(f"Context bytes (hex): {context_bytes.hex()}", flush=True)
+                            print(f"Context (utf-8, replace): {context_bytes.decode('utf-8', 'replace')}", flush=True)
+                        await msg.answer("❗ Ошибка парсера Telegram: не удалось отобразить форматированный текст. Попробуйте упростить оформление или отправить как plain text.")
+                        return
+                    # Логируем другие ошибки TelegramBadRequest
+                    print(f"[TelegramBadRequest] {e}\nИсходный текст: {repr(text)}\nHTML: {repr(html)}", flush=True)
+                    raise
+            tmp_path = f"/tmp/{filename_prefix}_{msg.message_id}.html.txt"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(html)
+            await msg.answer_document(FSInputFile(tmp_path))
             return
-        tmp_path = f"/tmp/{filename_prefix}_{msg.message_id}.txt"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(text)
-        await msg.answer_document(FSInputFile(tmp_path))
-        return
+        else:
+            if len(text) <= 3800:
+                await msg.answer(text)
+                return
+            tmp_path = f"/tmp/{filename_prefix}_{msg.message_id}.txt"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            await msg.answer_document(FSInputFile(tmp_path))
+            return
     if file_path:
         await msg.answer_document(FSInputFile(file_path))
         return
@@ -370,7 +474,7 @@ async def handle_help(msg: Message) -> None:
     if PROMPTS:
         for cmd, p in sorted(PROMPTS.items()):
             desc = p.description or ""
-            line = f"/{cmd} - {desc}"
+            line = f"`/{cmd} - {desc}`"
             lines.append(line)
     else:
         lines.append("(папка PROMPTS_DIR пуста)")
