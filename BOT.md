@@ -36,7 +36,6 @@
 Просто пришли фото боту.
 
 Он:
-• уменьшит
 • подготовит к анализу
 • применит промт по умолчанию
 • пришлёт разбор
@@ -46,7 +45,6 @@
 ### ▶ Отправить несколько фото
 Можно:
 ## Docker
-
 You can run the bot in Docker using the provided `Dockerfile` and `docker-compose.yml`.
 
 Basic usage:
@@ -56,6 +54,11 @@ docker compose up --build -d
 ```
 
 Run in debug mode (local development):
+
+### Command order in Telegram
+
+The bot registers commands via Telegram's `setMyCommands` API in the order they are appended in `setup_bot_commands()`.
+Note: some Telegram clients may display commands alphabetically or grouped; to control the order reliably, name your prompt files in `prompts/` with a numeric prefix (e.g. `01_art.txt`, `02_portrait.txt`) — the bot loads prompts sorted by filename and will register the commands in that order.
 
 ```bash
 DEBUG=1 IMAGE_DEBUG=1 docker compose up --build

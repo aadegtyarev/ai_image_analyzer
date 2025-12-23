@@ -414,6 +414,15 @@ async def setup_bot_commands() -> None:
     cmds.append(BotCommand(command="stats", description="Статистика по запросам"))
     cmds.append(BotCommand(command="help", description="Справка и список промтов"))
 
+    # Add dynamic prompt commands (from prompts/). Order follows filename sorting.
+    for pi in PROMPTS.values():
+        # ensure we don't exceed Telegram limits and avoid reserved names
+        try:
+            cmds.append(BotCommand(command=pi.command, description=pi.description[:80]))
+        except Exception:
+            # ignore any invalid commands
+            pass
+
     await bot.set_my_commands(cmds[:100])
 
 
