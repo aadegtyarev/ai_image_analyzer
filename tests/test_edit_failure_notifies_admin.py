@@ -1,0 +1,78 @@
+import time
+from types import SimpleNamespace
+import asyncio
+
+import bot
+
+
+class DummyMsgWithAnswer:
+    def __init__(self):
+        self.message_id = 99
+        self.chat = type("C", (), {"id": 12345})()
+        self.from_user = type("U", (), {"id": 5555})()
+
+    async def answer(self, text=None, parse_mode=None):
+        # Return a message-like object
+        return self
+
+
+def test_edit_failure_notifies_admin(monkeypatch, tmp_path):
+    mgid = "mg_edit_admin"
+    imgs = [(b"a", 100, 100, "square")]
+    reply = DummyMsgWithAnswer()
+
+    bot.MEDIA_CONTEXTS[mgid] = {
+        "images": imgs,
+        "system_prompt": "SP",
+        "prompt_label": "p",
+        "use_text_override": False,
+        "user_text": None,
+        "force_collage": True,
+        "reply_msg": reply,
+        "ts": time.time() - 10,
+    }
+
+    # make_collage stub
+    def fake_make_collage(images, max_size, jpeg_quality):
+        fnames = ["image_1.jpg"]
+        return (b"collage", fnames)
+
+    monkeypatch.setattr(bot, "make_collage", fake_make_collage)
+
+    # edit_message_text will raise
+    async def fake_edit_message_text(*args, **kwargs):
+        raise RuntimeError("edit failed")
+
+    monkeypatch.setattr(bot.bot, "edit_message_text", fake_edit_message_text)
+
+    # stub call_model_with_image
+    def fake_call_model_with_image(cfg, data, system_prompt=None, user_text=None, quiet=False, image_meta=None):
+        return ("RESULT", None)
+
+    monkeypatch.setattr(bot, "call_model_with_image", fake_call_model_with_image)
+
+    # capture admin notifications
+    admin_calls = []
+
+    async def fake_send_message(chat_id, text=None, **kwargs):
+        admin_calls.append((chat_id, text))
+
+    monkeypatch.setattr(bot.bot, "send_message", fake_send_message)
+
+    # assign admin id in module under test
+    bot.BOT_ADMIN_ID = 99999
+
+    cfg = SimpleNamespace(collage_max_size=1024, collage_quality=85)
+    bot.GROUP_WAIT = 0
+
+    asyncio.run(bot._process_media_group(mgid, cfg))
+
+    # ensure admin was notified and message contains expected fields
+    assert any(
+        call[0] == 99999
+        and "media_group_id: mg_edit_admin" in (call[1] or "")
+        and "prompt_label: p" in (call[1] or "")
+        and "user_id: 5555" in (call[1] or "")
+        and "chat_id: 12345" in (call[1] or "")
+        for call in admin_calls
+    )

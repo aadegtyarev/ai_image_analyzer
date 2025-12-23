@@ -40,3 +40,27 @@ def test_set_media_context_without_user_text(monkeypatch):
         B.set_media_context('mg4', {'system_prompt': 'S4', 'prompt_label': 'art', 'use_text_override': False})
     except Exception as e:
         raise AssertionError(f"set_media_context raised unexpectedly: {e}")
+
+
+def test_media_context_update_on_override(monkeypatch, tmp_path):
+    """If a prompt override or prompt file is provided after the first image, cached context must update."""
+    import bot as B
+    # initial context
+    B.set_media_context('mgX', {'system_prompt': 'S', 'prompt_label': 'art', 'use_text_override': False, 'user_text': None})
+
+    # override with text
+    B.update_media_context_with_override('mgX', None, 'override text', prompt_debug=True)
+    ctx = B.get_media_context('mgX')
+    assert ctx is not None
+    assert ctx.get('use_text_override') is True
+    assert ctx.get('user_text') == 'override text'
+    assert ctx.get('prompt_label') == 'текст из сообщения'
+
+    # override with prompt file
+    p = tmp_path / 'special.txt'
+    p.write_text('SPECIAL PROMPT\n', encoding='utf-8')
+    B.update_media_context_with_override('mgX', str(p), None, prompt_debug=True)
+    ctx2 = B.get_media_context('mgX')
+    assert ctx2 is not None
+    assert ctx2.get('prompt_label') == 'special'
+    assert 'SPECIAL PROMPT' in (ctx2.get('system_prompt') or '')

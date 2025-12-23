@@ -357,6 +357,316 @@ import time
 # Temporary cache for media group prompts: media_group_id -> {system_prompt, prompt_label, use_text_override, user_text, ts}
 MEDIA_CONTEXTS: Dict[str, dict] = {}
 MEDIA_CONTEXT_TTL = int(os.getenv("MEDIA_CONTEXT_TTL", "120"))
+GROUP_WAIT = float(os.getenv("GROUP_WAIT", "1.0"))
+
+
+async def _process_media_group(mgid: str, cfg) -> None:
+    """Background task: wait for GROUP_WAIT of inactivity, then process cached images as one request."""
+    try:
+        # Wait until there's GROUP_WAIT seconds since last addition
+        while True:
+            await asyncio.sleep(GROUP_WAIT)
+            ctx = get_media_context(mgid)
+            if not ctx:
+                return
+            if time.time() - ctx.get("ts", 0) >= GROUP_WAIT:
+                break
+
+        # Pop context to avoid re-processing
+        ctx = MEDIA_CONTEXTS.pop(mgid, None)
+        if not ctx:
+            return
+
+        # Build processing inputs
+        imgs = ctx.get("images", [])
+        system_prompt = ctx.get("system_prompt", "")
+        prompt_label = ctx.get("prompt_label", "без промта")
+        use_text_override = ctx.get("use_text_override", False)
+        user_text = ctx.get("user_text")
+        force_collage = ctx.get("force_collage", False)
+        reply_msg = ctx.get("reply_msg")
+
+        if not imgs or not reply_msg:
+            return
+
+        # Convert stored image tuples to resized-like tuples: (bytes, w, h, orient)
+        resized = imgs
+        # If a prompt_path is stored, prefer re-reading it at processing time so
+        # that the exact prompt file content is used (handles cases where system_prompt
+        # wasn't populated correctly earlier).
+        if not use_text_override and ctx.get("prompt_path"):
+            try:
+                sp = read_prompt_file(ctx.get("prompt_path"))
+                if sp:
+                    system_prompt = sp
+                    prompt_label = os.path.splitext(os.path.basename(ctx.get("prompt_path")))[0]
+                    if os.environ.get("DEBUG") or os.environ.get("IMAGE_DEBUG"):
+                        print(f"[PROMPT_DEBUG] reread prompt_path for media_group {mgid}: prompt_label={prompt_label}", file=sys.stderr)
+            except Exception:
+                pass
+        multiple = len(resized) > 1
+        per_image = PER_IMAGE_DEFAULT
+        if force_collage:
+            per_image = False
+
+        total_bytes = sum(len(b) for b, *_ in resized)
+        aggregated_texts: List[str] = []
+        total_cost_request = 0.0
+
+        if multiple and not per_image:
+            if os.environ.get("IMAGE_DEBUG") or os.environ.get("DEBUG"):
+                for idx, item in enumerate(resized, start=1):
+                    try:
+                        print(f"[IMAGE_DEBUG] resized #{idx} tuple: {repr(item)}", file=sys.stderr)
+                    except Exception:
+                        pass
+
+            named = [(f"image_{i+1}.jpg", b) for i, (b, w, h, o) in enumerate(resized)]
+            collage_bytes, file_names = make_collage(
+                named,
+                cfg.collage_max_size,
+                cfg.collage_quality,
+            )
+            if use_text_override:
+                collage_system_prompt = ""
+                user_text_for_call = user_text
+            else:
+                collage_system_prompt = build_collage_system_prompt(
+                    system_prompt,
+                    file_names,
+                )
+                user_text_for_call = None
+
+            # Build orientations mapping properly (orientation is the 4th element in resized tuples)
+            orientations = {f: orientation for f, (_, _, _, orientation) in zip(file_names, resized)}
+            collage_meta = {"mode": "collage", "orientations": orientations}
+
+            # Human-readable meta note for the model and logs
+            collage_meta_text = (
+                "Примечание для модели: это коллаж. "
+                "Ориентации по файлам: " + 
+                ", ".join(f"{fn} — {orientations[fn]}" for fn in file_names) + "."
+            )
+
+            try:
+                if os.environ.get("IMAGE_DEBUG") or os.environ.get("DEBUG"):
+                    print(f"[IMAGE_DEBUG] processing media_group {mgid} as COLLAGE; files={file_names}; meta={collage_meta}; collage_bytes={len(collage_bytes)}", file=sys.stderr)
+                    print(f"[IMAGE_DEBUG] meta_text: {collage_meta_text}", file=sys.stderr)
+
+                # Log which prompt will be used
+                try:
+                    if os.environ.get("DEBUG") or os.environ.get("IMAGE_DEBUG"):
+                        src = "text_override" if use_text_override else ("prompt_path" if ctx.get("prompt_path") else "system_prompt")
+                        print(f"[PROMPT_DEBUG] media_group {mgid} will use prompt_label={prompt_label} source={src} system_snip={(system_prompt or '')[:200]!r}", file=sys.stderr)
+                except Exception:
+                    pass
+
+                # Try to send a kickoff message via replying to the original message so we can edit it later.
+                status = None
+                try:
+                    sent = await reply_msg.answer(f"📷 Принял {len(resized)} файлов, объединил в коллаж и отправил модели.")
+                    # If the underlying library returns a Message, capture IDs for editing later
+                    if sent and hasattr(sent, "message_id"):
+                        chat_id = getattr(getattr(sent, "chat", None), "id", None)
+                        mid = getattr(sent, "message_id", None)
+                        if chat_id and mid:
+                            status = {"chat_id": chat_id, "message_id": mid}
+                except Exception:
+                    # Fallback to old behaviour: send a separate message (send_response)
+                    try:
+                        await send_response(reply_msg, f"📷 Принял {len(resized)} файлов, объединил в коллаж и отправил модели.")
+                    except Exception:
+                        pass
+
+                resp = call_model_with_image(
+                    cfg,
+                    collage_bytes,
+                    system_prompt=collage_system_prompt,
+                    user_text=user_text_for_call,
+                    quiet=True,
+                    image_meta=collage_meta,
+                )
+                if isinstance(resp, tuple):
+                    text_result, usage = resp
+                else:
+                    text_result, usage = resp, None
+
+                if usage:
+                    try:
+                        total_cost_request += float(usage.get("total_cost", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        pass
+
+                header = f"Коллаж — промт: {prompt_label}\n"
+                aggregated_texts.append(header + text_result)
+                final_text = "\n\n".join(aggregated_texts)
+                if total_cost_request > 0:
+                    final_text += f"\n\n💎 {total_cost_request:.3f} у.е."
+                # Try to edit the kickoff status message if we have one; fall back to sending a fresh response
+                if status:
+                    try:
+                        if FORMAT_MODE == 'HTML':
+                            html = simple_markdown_to_html(final_text)
+                            await bot.edit_message_text(html, chat_id=status["chat_id"], message_id=status["message_id"], parse_mode='HTML')
+                        else:
+                            await bot.edit_message_text(final_text, chat_id=status["chat_id"], message_id=status["message_id"])
+                        return
+                    except Exception as e:
+                        print(f"[MEDIA_DEBUG] failed to edit status message for media_group {mgid}: {e}", file=sys.stderr)
+                        import traceback as _tb
+                        _tb.print_exc(file=sys.stderr)
+                        # notify admin if configured
+                        try:
+                            if BOT_ADMIN_ID:
+                                # collect contextual info
+                                user_id = getattr(getattr(reply_msg, "from_user", None), "id", None)
+                                chat_id = getattr(getattr(reply_msg, "chat", None), "id", None)
+                                msg_id = getattr(reply_msg, "message_id", None)
+                                tb = ""
+                                try:
+                                    import traceback as _tb
+
+                                    tb = _tb.format_exc() or ""
+                                except Exception:
+                                    tb = "(traceback unavailable)"
+                                tb_snip = (tb[:400] + "...") if len(tb) > 400 else tb
+                                admin_text = (
+                                    "⚠️ Ошибка при редактировании статуса альбома\n"
+                                    f"media_group_id: {mgid}\n"
+                                    f"prompt_label: {prompt_label}\n"
+                                    f"user_id: {user_id}\n"
+                                    f"chat_id: {chat_id}\n"
+                                    f"message_id: {msg_id}\n"
+                                    f"Ошибка: {e}\n"
+                                    f"Traceback (первые 400 символов):\n{tb_snip}"
+                                )
+                                await bot.send_message(BOT_ADMIN_ID, admin_text)
+                        except Exception as ne:
+                            print(f"[MEDIA_DEBUG] failed to notify admin about edit failure: {ne}", file=sys.stderr)
+                        # fallback to sending a new message
+                        pass
+                await send_response(reply_msg, final_text, filename_prefix="images")
+            except Exception as e:
+                print(f"[MEDIA_DEBUG] failed to process media_group {mgid}: {e}", file=sys.stderr)
+                try:
+                    await send_response(reply_msg, "❌ Ошибка при обработке альбома. Пожалуйста, попробуйте ещё раз.")
+                except Exception:
+                    pass
+        else:
+            # Fallback: process per-image
+            # Try to send a single kickoff reply so we can edit it later; fallback to send_response
+            status = None
+            try:
+                sent = await reply_msg.answer(f"📷 Принял {len(resized)} файлов и отправляю их на поштучный анализ.")
+                if sent and hasattr(sent, "message_id"):
+                    chat_id = getattr(getattr(sent, "chat", None), "id", None)
+                    mid = getattr(sent, "message_id", None)
+                    if chat_id and mid:
+                        status = {"chat_id": chat_id, "message_id": mid}
+            except Exception:
+                try:
+                    await send_response(reply_msg, f"📷 Принял {len(resized)} файлов и отправляю их на поштучный анализ.")
+                except Exception:
+                    pass
+            for i, (jpeg, final_w, final_h, orientation) in enumerate(resized, start=1):
+                if use_text_override:
+                    system_prompt_for_call = ""
+                    user_text_for_call = user_text
+                else:
+                    system_prompt_for_call = system_prompt
+                    user_text_for_call = None
+                image_meta = {"orientation": orientation, "width": final_w, "height": final_h}
+                try:
+                    if os.environ.get("IMAGE_DEBUG") or os.environ.get("DEBUG"):
+                        print(f"[IMAGE_DEBUG] processing media_group {mgid} image #{i}; meta={image_meta}; bytes={len(jpeg)}", file=sys.stderr)
+                    resp = call_model_with_image(
+                        cfg,
+                        jpeg,
+                        system_prompt=system_prompt_for_call,
+                        user_text=user_text_for_call,
+                        quiet=True,
+                        image_meta=image_meta,
+                    )
+                    if isinstance(resp, tuple):
+                        text_result, usage = resp
+                    else:
+                        text_result, usage = resp, None
+
+                    if usage:
+                        try:
+                            total_cost_request += float(usage.get("total_cost", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            pass
+
+                    header = f"Изображение #{i} — промт: {prompt_label}\n"
+                    aggregated_texts.append(header + text_result)
+                except Exception as e:
+                    print(f"[MEDIA_DEBUG] failed image #{i} in media_group {mgid}: {e}", file=sys.stderr)
+
+            final_text = "\n\n".join(aggregated_texts)
+            if total_cost_request > 0:
+                final_text += f"\n\n💎 {total_cost_request:.3f} у.е."
+            # Try to edit the kickoff status message with the final results; else send a new message
+            if status:
+                try:
+                    if FORMAT_MODE == 'HTML':
+                        html = simple_markdown_to_html(final_text)
+                        await bot.edit_message_text(html, chat_id=status["chat_id"], message_id=status["message_id"], parse_mode='HTML')
+                    else:
+                        await bot.edit_message_text(final_text, chat_id=status["chat_id"], message_id=status["message_id"])
+                    return
+                except Exception as e:
+                    print(f"[MEDIA_DEBUG] failed to edit status message for media_group {mgid}: {e}", file=sys.stderr)
+                    import traceback as _tb
+                    _tb.print_exc(file=sys.stderr)
+                    # notify admin if configured
+                    try:
+                        if BOT_ADMIN_ID:
+                            # collect contextual info
+                            user_id = getattr(getattr(reply_msg, "from_user", None), "id", None)
+                            chat_id = getattr(getattr(reply_msg, "chat", None), "id", None)
+                            msg_id = getattr(reply_msg, "message_id", None)
+                            tb = ""
+                            try:
+                                import traceback as _tb
+
+                                tb = _tb.format_exc() or ""
+                            except Exception:
+                                tb = "(traceback unavailable)"
+                            tb_snip = (tb[:400] + "...") if len(tb) > 400 else tb
+                            admin_text = (
+                                "⚠️ Ошибка при редактировании статуса альбома\n"
+                                f"media_group_id: {mgid}\n"
+                                f"prompt_label: {prompt_label}\n"
+                                f"user_id: {user_id}\n"
+                                f"chat_id: {chat_id}\n"
+                                f"message_id: {msg_id}\n"
+                                f"Ошибка: {e}\n"
+                                f"Traceback (первые 400 символов):\n{tb_snip}"
+                            )
+                            await bot.send_message(BOT_ADMIN_ID, admin_text)
+                    except Exception as ne:
+                        print(f"[MEDIA_DEBUG] failed to notify admin about edit failure: {ne}", file=sys.stderr)
+                    # fallback to sending a new message
+                    pass
+            try:
+                await send_response(reply_msg, final_text, filename_prefix="images")
+            except Exception:
+                pass
+
+    except Exception:
+        try:
+            env_dbg = os.environ.get("DEBUG", None)
+            if env_dbg is None:
+                env_dbg = os.environ.get("IMAGE_DEBUG", "")
+            media_debug = str(env_dbg).lower() in ("1", "true", "yes")
+        except Exception:
+            media_debug = False
+        if media_debug:
+            print(f"[MEDIA_DEBUG] unexpected error while processing media_group {mgid}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+        else:
+            print(f"[MEDIA_DEBUG] unexpected error while processing media_group {mgid}", file=sys.stderr)
 
 
 def _cleanup_media_contexts() -> None:
@@ -382,6 +692,44 @@ def get_media_context(media_group_id: Optional[str]) -> Optional[dict]:
     return MEDIA_CONTEXTS.get(media_group_id)
 
 
+def update_media_context_with_override(media_group_id: str, prompt_path: Optional[str], text_override: Optional[str], prompt_debug: bool = False) -> None:
+    """If a media context exists for media_group_id, update it with a provided prompt_path or override text.
+
+    This allows users to send a prompt/command after the first image of an album and have the
+    album use the newest prompt instead of the cached one.
+    """
+    if not media_group_id:
+        return
+    ctx = get_media_context(media_group_id)
+    if not ctx:
+        return
+    changed = False
+    try:
+        if text_override:
+            ctx["use_text_override"] = True
+            ctx["user_text"] = text_override
+            ctx["system_prompt"] = ""
+            ctx["prompt_label"] = "текст из сообщения"
+            changed = True
+        if prompt_path:
+            try:
+                sp = read_prompt_file(prompt_path)
+            except Exception:
+                sp = ""
+            ctx["system_prompt"] = sp
+            ctx["prompt_label"] = os.path.splitext(os.path.basename(prompt_path))[0]
+            ctx["prompt_path"] = prompt_path
+            changed = True
+        if changed:
+            set_media_context(media_group_id, ctx)
+            if prompt_debug:
+                print(f"[PROMPT_DEBUG] updated media context {media_group_id}: prompt_label={ctx.get('prompt_label')}", file=sys.stderr)
+    except Exception:
+        # be resilient; don't let a helper blow up main handler
+        if prompt_debug:
+            print(f"[PROMPT_DEBUG] failed to update media context {media_group_id}", file=sys.stderr)
+
+
 def set_media_context(media_group_id: str, ctx: dict) -> None:
     ctx = dict(ctx)
     ctx["ts"] = time.time()
@@ -403,11 +751,10 @@ async def setup_bot_commands() -> None:
 
     cmds: List[BotCommand] = []
 
-    cmds.append(BotCommand(command="text", description="Текст вместо промта (для фото)"))
-        # note: 'group' flag can be passed as parameter to any command to request collage behaviour
-    cmds.append(BotCommand(command="howto", description="Список howto-заметок"))
-    cmds.append(BotCommand(command="stats", description="Статистика по запросам"))
     cmds.append(BotCommand(command="help", description="Справка и список промтов"))
+    cmds.append(BotCommand(command="howto", description="Список howto-заметок"))
+    cmds.append(BotCommand(command="text", description="Текст вместо промта (для фото)"))
+    cmds.append(BotCommand(command="stats", description="Статистика по запросам"))    
 
     # Add dynamic prompt commands (from prompts/). Order follows filename sorting.
     for pi in PROMPTS.values():
@@ -528,46 +875,60 @@ async def handle_help(msg: Message) -> None:
     if not is_allowed(msg.from_user.id):
         return
 
+    # Основной блок справки и режимов. Флаг `group` используется для запроса коллажа
+    # при отправке нескольких фото (например: `/text group` или `/art group`).
     lines: List[str] = [
-        "AI Photo Assistant",
+        "**AI Photo Assistant**",
         "",
         "📷 Отправь фото — получишь разбор.",
-        "✍ Если вместе с фото написать текст, он заменит системный промт.",
         "",
-        "🎯 Промты (файлы из папки prompts):",
+        "",
+        "🛠 Команды:",
+        "- /howto – список howto-заметок.",
+        "- /stats – твоя личная статистика.",
+        "- /help – краткая справка.",
     ]
-
-    if PROMPTS:
-        for cmd, p in sorted(PROMPTS.items()):
-            desc = p.description or ""
-            line = f"`/{cmd}` - {desc}"
-            lines.append(line)
-    else:
-        lines.append("(папка PROMPTS_DIR пуста)")
-
-    lines.extend(
-        [
-            "",
-            "🛠 Режимы:",
-            "`/text` – использовать текст сообщения как запрос (без системного промта).",
-            "`/text_collage` – то же, но несколько фото собираются в коллаж.",
-            "/howto – список howto-заметок.",
-            "/stats – твоя личная статистика.",
-            "/help – краткая справка.",
-        ]
-    )
 
     if is_admin(msg.from_user.id) and msg.chat.type == ChatType.PRIVATE:
         lines.extend(
             [
                 "",
+                "",
                 "👑 Админ-команды (ручной ввод):",
-                "/users – список разрешённых пользователей.",
-                "`/user_add USER_ID` Описание – добавить пользователя.",
-                "`/user_del USER_ID` – удалить пользователя.",
-                "`/stats_reset USER_ID` – сброс статистики пользователя.",
-                "/stats_all – общая статистика по всем.",
-                "/balance – баланс API.",
+                "- /users – список разрешённых пользователей.",
+                "- `/user_add USER_ID` Описание – добавить пользователя.",
+                "- `/user_del USER_ID` – удалить пользователя.",
+                "- `/stats_reset USER_ID` – сброс статистики пользователя.",
+                "- /stats_all – общая статистика по всем.",
+                "- /balance – баланс API.",
+            ]
+        )
+
+        lines.extend(
+            [
+                "",
+                "",
+                "🎯 Промты:",
+            ]
+        )
+
+        # Добавляем список промтов (если есть)
+        if PROMPTS:
+            for cmd, p in sorted(PROMPTS.items()):
+                desc = p.description or ""
+                line = f"- `/{cmd}` - {desc}"
+                lines.append(line)
+        else:
+            lines.append("(папка PROMPTS_DIR пуста)")
+
+        lines.extend(
+            [
+                "",
+                "",
+                "📒 Дополнительно:",
+                "- Если вместе с фото написать текст, он заменит системный промт.",
+                "- Добавьте флаг `group` (например `/text group` или `/art group`), чтобы при нескольких фото собрать коллаж.",                                
+                "- `/text` – использовать текст сообщения как запрос (без системного промта).",                
             ]
         )
 
@@ -978,13 +1339,49 @@ async def main_handler(msg: Message) -> None:
         mgid = getattr(msg, "media_group_id", None)
         cached = get_media_context(mgid) if mgid else None
         if cached:
-            # reuse cached prompt info for this media group
+            # If the current message provides a prompt override or a specific prompt command,
+            # prefer those values and update the cached context so subsequent images use them.
+            update_media_context_with_override(mgid, prompt_path, text_after_cmd, prompt_debug=prompt_debug)
+            # reload cached after potential update
+            cached = get_media_context(mgid) or {}
             system_prompt = cached.get("system_prompt", "")
             prompt_label = cached.get("prompt_label", "без промта")
             use_text_override = cached.get("use_text_override", False)
             user_text = cached.get("user_text")
             if prompt_debug:
                 print(f"[PROMPT_DEBUG][{request_id}] using cached media prompt for media_group_id={mgid}: prompt_label={prompt_label}", file=sys.stderr)
+            # If we have a cached media context, append current resized images to it and
+            # schedule background processing (regardless of whether this particular
+            # message contained the `group` flag). This ensures all images in the
+            # media group are collected and processed together.
+            try:
+                ctx = get_media_context(mgid) or {}
+                imgs = ctx.get("images", [])
+                for (b, w, h, o) in resized:
+                    imgs.append((b, w, h, o))
+                ctx["images"] = imgs
+                ctx.setdefault("system_prompt", system_prompt)
+                ctx.setdefault("prompt_label", prompt_label)
+                # prefer any override flags already present
+                ctx.setdefault("use_text_override", use_text_override)
+                ctx.setdefault("user_text", user_text)
+                ctx.setdefault("reply_msg", msg)
+                set_media_context(mgid, ctx)
+                if not ctx.get("task_scheduled"):
+                    try:
+                        asyncio.create_task(_process_media_group(mgid, cfg))
+                        ctx["task_scheduled"] = True
+                        set_media_context(mgid, ctx)
+                    except Exception:
+                        pass
+                # Stop further immediate processing of this message; we'll send a single
+                # summary message when the album is actually processed in
+                # `_process_media_group` to avoid multiple ack messages.
+                return
+            except Exception:
+                # If caching fails for some reason, fall through to normal processing
+                if prompt_debug:
+                    print(f"[MEDIA_DEBUG] failed to append to media context {mgid}", file=sys.stderr)
         else:
             if use_text_override:
                 user_text = text_after_cmd
@@ -997,9 +1394,18 @@ async def main_handler(msg: Message) -> None:
                 prompt_label = os.path.splitext(os.path.basename(prompt_path))[0]
                 if prompt_debug:
                     print(f"[PROMPT_DEBUG][{request_id}] prompt_path={prompt_path!r}, prompt_label={prompt_label!r}, system_snip={system_prompt[:200]!r}", file=sys.stderr)
-                # If this message is part of a media group, cache the prompt info so subsequent messages reuse it
-                if mgid:
-                    set_media_context(mgid, {"system_prompt": system_prompt, "prompt_label": prompt_label, "use_text_override": use_text_override, "user_text": user_text})
+                    # If this message is part of a media group, cache the prompt info so subsequent messages reuse it
+                    if mgid:
+                        set_media_context(
+                            mgid,
+                            {
+                                "system_prompt": system_prompt,
+                                "prompt_label": prompt_label,
+                                "prompt_path": prompt_path,
+                                "use_text_override": use_text_override,
+                                "user_text": user_text,
+                            },
+                        )
             else:
                 if not cfg.prompt_file:
                     system_prompt = ""
@@ -1012,7 +1418,16 @@ async def main_handler(msg: Message) -> None:
                     if prompt_debug:
                         print(f"[PROMPT_DEBUG][{request_id}] cfg.prompt_file={cfg.prompt_file!r}, prompt_label={prompt_label!r}, system_snip={system_prompt[:200]!r}", file=sys.stderr)
                     if mgid:
-                        set_media_context(mgid, {"system_prompt": system_prompt, "prompt_label": prompt_label, "use_text_override": use_text_override, "user_text": user_text})
+                        set_media_context(
+                            mgid,
+                            {
+                                "system_prompt": system_prompt,
+                                "prompt_label": prompt_label,
+                                "prompt_path": cfg.prompt_file,
+                                "use_text_override": use_text_override,
+                                "user_text": user_text,
+                            },
+                        )
 
                 # If debug enabled, print a short sanitized payload summary to stderr for easier tracing
                 try:
@@ -1027,6 +1442,39 @@ async def main_handler(msg: Message) -> None:
                         print(f"[PROMPT_DEBUG][{request_id}] payload_summary: {sp}", file=sys.stderr)
                 except Exception:
                     print(f"[PROMPT_DEBUG][{request_id}] failed to build payload summary", file=sys.stderr)
+
+        # Если это media_group — всегда кэшируем изображения и отложенно обработаем альбом.
+        # Это гарантирует, что промт/флаги, присланные ПОСЛЕ первого файла, применятся ко всем файлам альбома.
+        if mgid:
+            # Append all images from this message to media context and schedule processing
+            ctx = get_media_context(mgid) or {}
+            imgs = ctx.get("images", [])
+            for (b, w, h, o) in resized:
+                imgs.append((b, w, h, o))
+            ctx["images"] = imgs
+            ctx.setdefault("system_prompt", system_prompt)
+            ctx.setdefault("prompt_label", prompt_label)
+            # prefer any override flags already present; but allow current message to set force_collage
+            ctx.setdefault("use_text_override", use_text_override)
+            ctx.setdefault("user_text", user_text)
+            # if a 'group' flag was provided on this message, prefer it
+            if flag_group:
+                ctx["force_collage"] = True
+            else:
+                ctx.setdefault("force_collage", ctx.get("force_collage", False))
+            ctx["reply_msg"] = msg
+            set_media_context(mgid, ctx)
+            # schedule background processing once
+            if not ctx.get("task_scheduled"):
+                try:
+                    asyncio.create_task(_process_media_group(mgid, cfg))
+                    ctx["task_scheduled"] = True
+                    set_media_context(mgid, ctx)
+                except Exception:
+                    pass
+            # Do not send per-image acknowledgements; processing will send a single
+            # summary message when the album is processed.
+            return
 
         # статусное сообщение (без Markdown, чтобы промт с _ не ломал парсер)
         def fmt_mb(n_bytes: int) -> str:

@@ -116,13 +116,17 @@ def load_config() -> Config:
 
 
 def read_prompt_file(path: Optional[str]) -> str:
+    # Non-fatal: if no path is provided or the file cannot be read, return an
+    # empty string and log a warning instead of exiting the process. The bot
+    # will handle an empty system prompt gracefully.
     if not path:
-        sys.exit("ERROR: PROMPT_FILE is not set but required in this mode")
+        return ""
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read().strip()
     except OSError as e:
-        sys.exit(f"ERROR: failed to read PROMPT_FILE={path!r}: {e}")
+        print(f"ERROR: failed to read PROMPT_FILE={path!r}: {e}", file=sys.stderr)
+        return ""
 
 
 def load_config_from_env(env: dict):
