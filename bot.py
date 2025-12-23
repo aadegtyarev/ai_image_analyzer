@@ -32,7 +32,19 @@ load_dotenv()
 # --- ENV / paths ---
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BOT_ADMIN_ID = int(os.getenv("BOT_ADMIN_ID", "0"))
+def _int_from_env(name: str, default: int = 0) -> int:
+    val = os.getenv(name, "")
+    if val is None:
+        return default
+    # strip inline comments and whitespace
+    try:
+        val = val.split("#", 1)[0].strip()
+        return int(val) if val != "" else default
+    except Exception:
+        return default
+
+
+BOT_ADMIN_ID = _int_from_env("BOT_ADMIN_ID", 0)
 BOT_ADMIN_USERNAME = os.getenv("BOT_ADMIN_USERNAME")
 
 PROMPTS_DIR = os.getenv("PROMPTS_DIR", "prompts")
