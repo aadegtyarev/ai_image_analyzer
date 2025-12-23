@@ -44,11 +44,7 @@ requests>=2.0.0
 
 ```bash
 cp .env.example .env
-```
-
 Пример переменных (убедитесь, что задали `BOT_TOKEN` и `BOT_ADMIN_ID`):
-
-```env
 BOT_TOKEN=your_tg_bot_token
 BOT_ADMIN_ID=123456789
 
@@ -56,6 +52,12 @@ OPENAI_API_KEY=your_openai_key
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4o-mini
 
+### Environment variables
+
+You can control admin notifications for edit failures using `NOTIFY_ON_EDIT_FAILURE` (default: disabled).
+
+- `NOTIFY_ON_EDIT_FAILURE=1` — send admin a short notification when the bot fails to edit a kickoff message and falls back to sending a new message.
+- `NOTIFY_ON_EDIT_FAILURE=0` — (default) do not send admin notifications on edit failures.
 IMAGE_MAX_SIZE=1024
 IMAGE_QUALITY=85
 PROMPT_FILE=prompts/art_analysis.txt
@@ -63,7 +65,6 @@ PROMPT_FILE=prompts/art_analysis.txt
 
 * `OPENAI_BASE_URL` — можно указывать прокси/совместимые сервисы.
 * Все параметры `.env` можно **переопределить из CLI** одноимёнными флагами:
-
   * `--OPENAI_MODEL`, `--OPENAI_TIMEOUT`, `--IMAGE_MAX_SIZE` и т.д.
 
 * `OPENAI_MAX_TOKENS` отвечает за максимальное число токенов, которое модель может сгенерировать (параметр `max_tokens`).
@@ -78,15 +79,9 @@ PROMPT_FILE=prompts/art_analysis.txt
 
 ```bash
 python ai_image_analyzer.py [OPTIONS] [images...]
-```
-
-Где `images` — пути или маски (`"images/*.jpg"`).
-
-### Основные опции
 
 * `-p, --PROMPT_FILE` — переопределить файл промта (`PROMPT_FILE` из `.env`).
 * `-t, --text` — текст для отправки как `user` (PROMPT_FILE игнорируется, файл не создаётся).
-* `--per-image` — анализ каждого изображения отдельным запросом (без коллажа, без group-файла).
 * `--check-balance` — проверить баланс провайдера и вывести JSON.
 * `-q, --quiet` — тихий режим (минимум логов, подавляет вывод USAGE).
 

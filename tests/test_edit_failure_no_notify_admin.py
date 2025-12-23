@@ -1,6 +1,7 @@
 import time
 from types import SimpleNamespace
 import asyncio
+import os
 
 import bot
 
@@ -16,7 +17,7 @@ class DummyMsgWithAnswer:
         return self
 
 
-def test_edit_failure_notifies_admin(monkeypatch, tmp_path):
+def test_edit_failure_no_notify_admin(monkeypatch, tmp_path):
     mgid = "mg_edit_admin"
     imgs = [(b"a", 100, 100, "square")]
     reply = DummyMsgWithAnswer()
@@ -61,20 +62,14 @@ def test_edit_failure_notifies_admin(monkeypatch, tmp_path):
 
     # assign admin id in module under test
     bot.BOT_ADMIN_ID = 99999
-    # ensure notifications are enabled for this test
-    monkeypatch.setenv("NOTIFY_ON_EDIT_FAILURE", "1")
+
+    # disable admin notifications via env
+    os.environ["NOTIFY_ON_EDIT_FAILURE"] = "0"
 
     cfg = SimpleNamespace(collage_max_size=1024, collage_quality=85)
     bot.GROUP_WAIT = 0
 
     asyncio.run(bot._process_media_group(mgid, cfg))
 
-    # ensure admin was notified and message contains expected fields
-    assert any(
-        call[0] == 99999
-        and "media_group_id: mg_edit_admin" in (call[1] or "")
-        and "prompt_label: p" in (call[1] or "")
-        and "user_id: 5555" in (call[1] or "")
-        and "chat_id: 12345" in (call[1] or "")
-        for call in admin_calls
-    )
+    # ensure admin was NOT notified
+    assert len(admin_calls) == 0

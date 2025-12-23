@@ -515,9 +515,11 @@ async def _process_media_group(mgid: str, cfg) -> None:
                         print(f"[MEDIA_DEBUG] failed to edit status message for media_group {mgid}: {e}", file=sys.stderr)
                         import traceback as _tb
                         _tb.print_exc(file=sys.stderr)
-                        # notify admin if configured
+                        # notify admin if configured and enabled
                         try:
-                            if BOT_ADMIN_ID:
+                            notify_on_edit = os.getenv("NOTIFY_ON_EDIT_FAILURE", "0")
+                            notify_ok = str(notify_on_edit).lower() in ("1", "true", "yes")
+                            if BOT_ADMIN_ID and notify_ok:
                                 # collect contextual info
                                 user_id = getattr(getattr(reply_msg, "from_user", None), "id", None)
                                 chat_id = getattr(getattr(reply_msg, "chat", None), "id", None)
@@ -619,9 +621,11 @@ async def _process_media_group(mgid: str, cfg) -> None:
                     print(f"[MEDIA_DEBUG] failed to edit status message for media_group {mgid}: {e}", file=sys.stderr)
                     import traceback as _tb
                     _tb.print_exc(file=sys.stderr)
-                    # notify admin if configured
+                    # notify admin if configured and enabled
                     try:
-                        if BOT_ADMIN_ID:
+                        notify_on_edit = os.getenv("NOTIFY_ON_EDIT_FAILURE", "0")
+                        notify_ok = str(notify_on_edit).lower() in ("1", "true", "yes")
+                        if BOT_ADMIN_ID and notify_ok:
                             # collect contextual info
                             user_id = getattr(getattr(reply_msg, "from_user", None), "id", None)
                             chat_id = getattr(getattr(reply_msg, "chat", None), "id", None)
