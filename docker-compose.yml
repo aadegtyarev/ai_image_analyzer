@@ -1,9 +1,8 @@
-version: "3.8"
 services:
   bot:
     build: .
     image: ai_image_analyzer:latest
-    container_name: ai_image_analyzer_bot
+    container_name: ai_image_analyzer
     env_file:
       - .env
     volumes:
@@ -12,6 +11,7 @@ services:
       - ./db:/app/db
     restart: unless-stopped
     environment:
+      - PYTHONUNBUFFERED=1
       - DEBUG=0
     command: python bot.py
     healthcheck:
