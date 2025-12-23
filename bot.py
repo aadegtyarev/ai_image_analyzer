@@ -26,6 +26,7 @@ from ai_image_analyzer import (
     check_balance,
 )
 from typing import Dict
+import socket
 
 load_dotenv()
 
@@ -1642,7 +1643,19 @@ async def main_handler(msg: Message) -> None:
 async def main() -> None:
     await setup_bot_commands()
     print("Bot is running...")
+    # notify admin that bot started (short and non-blocking, best-effort)
+    await notify_admin_startup()
     await dp.start_polling(bot)
+
+
+async def notify_admin_startup() -> None:
+    try:
+        if BOT_ADMIN_ID:
+            host = socket.gethostname()
+            admin_text = f"✅ Bot started and ready on {host}."
+            await bot.send_message(BOT_ADMIN_ID, admin_text)
+    except Exception as e:
+        print(f"[STARTUP] failed to notify admin: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
