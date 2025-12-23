@@ -888,8 +888,7 @@ async def send_howto_item(msg: Message, name: str) -> None:
 
 
 async def handle_help(msg: Message) -> None:
-    if not is_allowed(msg.from_user.id):
-        return
+    allowed = is_allowed(msg.from_user.id)
 
     # Основной блок справки и режимов. Флаг `group` используется для запроса коллажа
     # при отправке нескольких фото (например: `/text group` или `/art group`).
@@ -904,6 +903,7 @@ async def handle_help(msg: Message) -> None:
         "- /stats – твоя личная статистика.",
         "- /help – краткая справка.",
     ]
+    
 
     if is_admin(msg.from_user.id) and msg.chat.type == ChatType.PRIVATE:
         lines.extend(
@@ -947,6 +947,8 @@ async def handle_help(msg: Message) -> None:
                 "- `/text` – использовать текст сообщения как запрос (без системного промта).",                
             ]
         )
+        if not allowed:
+            lines.insert(2, "⚠️ Вы не авторизованы для использования бота. Попросите админа добавить ваш ID через /user_add.")
 
     await send_response(msg, "\n".join(lines))
 
