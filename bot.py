@@ -140,20 +140,16 @@ def set_user_meta(uid: int, description: str, username: str = "", full_name: str
 
 # --- markdown escape ---
 
-def escape_md(text: str) -> str:
-    """Простейшее экранирование под Telegram Markdown (v1)."""
-    for ch in ("\\", "_", "*", "[", "]", "(", ")"):
-        text = text.replace(ch, "\\" + ch)
-    return text
+def escape_markdown_v2(text: str) -> str:
+    """
+    Escapes Telegram MarkdownV2 special chars.
+    Docs: https://core.telegram.org/bots/api#markdownv2-style
+    """
+    if text is None:
+        return ""
 
-
-def escape_md_smart(text: str) -> str:
-    """Экранирование Markdown, пропуская части внутри `...`."""
-    parts = text.split('`')
-    for i in range(len(parts)):
-        if i % 2 == 0:  # вне backticks
-            parts[i] = escape_md(parts[i])
-    return '`'.join(parts)
+    special_chars = r"_*[]()~`>#+-=|{}.!"
+    return "".join("\\" + c if c in special_chars else c for c in text)
 
 # --- prompts & commands ---
 
@@ -298,7 +294,7 @@ async def send_text_or_file(
         await msg.answer("⚠ Пустое сообщение.", parse_mode=None)
         return
     if len(text) <= 3800:
-        await msg.answer(text)
+        await msg.answer(text, parse_mode=ParseMode.MARKDOWN_V2)
     else:
         tmp_path = f"/tmp/{filename_prefix}_{msg.message_id}.txt"
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -708,7 +704,7 @@ async def main_handler(msg: Message) -> None:
                     total_cost = float(usage.get("total_cost", 0.0) or 0.0)
                 except (TypeError, ValueError):
                     total_cost = 0.0
-            safe_body = escape_md(text_result)
+            safe_body = escape_hash(text_result)
             final = safe_body
             if total_cost > 0:
                 final += f"\n\n*💎 {total_cost:.3f} у.е.*"
@@ -764,8 +760,8 @@ async def main_handler(msg: Message) -> None:
 
         await msg.answer(
             f"📷 Взял в работу {n_files} {files_word}. "
-            f"Размер {fmt_mb(orig_total)} → {fmt_mb(resized_total)}, "
-            f"промт {prompt_label}.",            
+            f"Размер {escape_md(fmt_mb(orig_total))} → {escape_md(fmt_mb(resized_total))}, "
+            f"промт {escape_md(prompt_label)}.",            
         )
 
         multiple = len(resized) > 1
@@ -819,7 +815,7 @@ async def main_handler(msg: Message) -> None:
                 except (TypeError, ValueError):
                     pass
 
-            aggregated_texts.append(escape_md(text_result))
+            aggregated_texts.append(escape_hash(text_result))
         else:
             for i, jpeg in enumerate(resized, start=1):
                 if use_text_override:
@@ -856,7 +852,7 @@ async def main_handler(msg: Message) -> None:
                         pass
 
                 header = f"*Изображение #{i}*\n"
-                aggregated_texts.append(header + escape_md(text_result))
+                aggregated_texts.append(header + escape_hash(text_result))
 
         final_text = "\n\n".join(aggregated_texts)
         if total_cost_request > 0:
