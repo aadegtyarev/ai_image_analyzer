@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Optional
 
 from dotenv import load_dotenv
+
 from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message, FSInputFile, BotCommand
-from aiogram.enums import ParseMode, ChatType
+from aiogram.enums import ChatType
 from aiogram.client.default import DefaultBotProperties
 
 from ai_image_analyzer import (
@@ -46,10 +47,7 @@ if not BOT_TOKEN:
 
 # --- aiogram wiring ---
 
-bot = Bot(
-    BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
-)
+bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
@@ -138,18 +136,32 @@ def set_user_meta(uid: int, description: str, username: str = "", full_name: str
     }
     save_users(users_db)
 
-# --- markdown escape ---
 
-def escape_markdown_v2(text: str) -> str:
+# --- централизованная отправка сообщений ---
+async def send_response(
+    msg: Message,
+    text: str = None,
+    file_path: str = None,
+    filename_prefix: str = "response",
+) -> None:
     """
-    Escapes Telegram MarkdownV2 special chars.
-    Docs: https://core.telegram.org/bots/api#markdownv2-style
+    Унифицированная отправка текста или файла в Telegram (plain text).
+    text: строка для отправки (если есть)
+    file_path: путь к файлу для отправки (если есть)
     """
-    if text is None:
-        return ""
-
-    special_chars = r"_*[]()~`>#+-=|{}.!"
-    return "".join("\\" + c if c in special_chars else c for c in text)
+    if text:
+        if len(text) <= 3800:
+            await msg.answer(text)
+            return
+        tmp_path = f"/tmp/{filename_prefix}_{msg.message_id}.txt"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        await msg.answer_document(FSInputFile(tmp_path))
+        return
+    if file_path:
+        await msg.answer_document(FSInputFile(file_path))
+        return
+    await msg.answer("⚠ Пустое сообщение.")
 
 # --- prompts & commands ---
 
@@ -285,63 +297,61 @@ def get_cfg():
     return load_config()
 
 
-async def send_text_or_file(
-    msg: Message,
-    text: str,
-    filename_prefix: str = "response",
-) -> None:
-    if not text:
-        await msg.answer("⚠ Пустое сообщение.", parse_mode=None)
-        return
-    if len(text) <= 3800:
-        await msg.answer(text, parse_mode=ParseMode.MARKDOWN_V2)
-    else:
-        tmp_path = f"/tmp/{filename_prefix}_{msg.message_id}.txt"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(text)
-        await msg.answer_document(FSInputFile(tmp_path))
+
 
 
 async def safe_error_reply(msg: Message, err: Exception) -> None:
+    """
+    Унифицированная обработка ошибок: логирует traceback, сообщает пользователю суть и совет.
+    """
     traceback.print_exc()
-    if msg.from_user and is_admin(msg.from_user.id):
-        text = f"❌ Внутренняя ошибка: {err}"
+    user_id = msg.from_user.id if msg.from_user else 0
+    if is_admin(user_id):
+        text = (
+            f"❌ Внутренняя ошибка: {err}\n"
+            f"\n"
+            f"Traceback см. в логах.\n"
+            f"Если ошибка повторяется — проверьте конфиг, переменные окружения, логи сервера."
+        )
     else:
-        text = "❌ Что-то пошло не так при обработке запроса."
+        text = (
+            "❌ Произошла ошибка при обработке запроса. "
+            "Пожалуйста, попробуйте ещё раз позже. "
+            "Если ошибка повторяется — напишите администратору."
+        )
     try:
-        await msg.answer(text, parse_mode=None)
+        await send_response(msg, text)
     except Exception:
         traceback.print_exc()
 
 
 async def send_howto_list(msg: Message) -> None:
     if not os.path.isdir(HOWTO_DIR):
-        await msg.answer("📚 Папка howto пуста или недоступна.", parse_mode=None)
+        await send_response(msg, "📚 Папка howto пуста или недоступна.")
         return
     files = [
         f[:-3] for f in os.listdir(HOWTO_DIR) if f.lower().endswith(".md")
     ]
     if not files:
-        await msg.answer("📚 Пока нет howto-заметок.", parse_mode=None)
+        await send_response(msg, "📚 Пока нет howto-заметок.")
         return
     lines = ["📚 Доступные howto:"]
     for name in sorted(files):
-        lines.append(f"`/howto {name}`")
-    await msg.answer("\n".join(lines))
+        lines.append(f"/howto {name}")
+    await send_response(msg, "\n".join(lines))
 
 
 async def send_howto_item(msg: Message, name: str) -> None:
     path = os.path.join(HOWTO_DIR, f"{name}.md")
     if not os.path.exists(path):
-        await msg.answer("❌ Нет такого howto.", parse_mode=None)
+        await send_response(msg, "❌ Нет такого howto.")
         return
     with open(path, "r", encoding="utf-8") as f:
         body = f.read()
     if not body.strip():
-        await msg.answer("⚠ Файл howto пуст.", parse_mode=None)
+        await send_response(msg, "⚠ Файл howto пуст.")
         return
-    # howto — это наш markdown из файла, отдаём как есть
-    await send_text_or_file(msg, body, filename_prefix=f"howto_{name}")
+    await send_response(msg, body, filename_prefix=f"howto_{name}")
 
 
 async def handle_help(msg: Message) -> None:
@@ -360,7 +370,7 @@ async def handle_help(msg: Message) -> None:
     if PROMPTS:
         for cmd, p in sorted(PROMPTS.items()):
             desc = p.description or ""
-            line = f"`/{cmd}` - {escape_md(desc)}"
+            line = f"/{cmd} - {desc}"
             lines.append(line)
     else:
         lines.append("(папка PROMPTS_DIR пуста)")
@@ -391,8 +401,7 @@ async def handle_help(msg: Message) -> None:
             ]
         )
 
-    safe_lines = [escape_md_smart(line) for line in lines]
-    await msg.answer("\n".join(safe_lines))
+    await send_response(msg, "\n".join(lines))
 
 
 async def extract_images_from_message(message: Message) -> List[bytes]:
@@ -458,7 +467,7 @@ async def main_handler(msg: Message) -> None:
                 text = "\n".join(lines)
             else:
                 text = "👥 Список пуст."
-            await msg.answer(text, parse_mode=None)
+            await send_response(msg, text)
             return
 
         if cmd == "user_add":
@@ -516,9 +525,7 @@ async def main_handler(msg: Message) -> None:
             if uid not in enabled:
                 enabled.append(uid)
             set_user_meta(uid, description=description, username=username, full_name=full_name)
-            await msg.answer(
-                f"✅ Пользователь `{uid}` добавлен в список.",                
-            )
+            await send_response(msg, f"✅ Пользователь {uid} добавлен в список.")
             return
 
         if cmd == "user_del":
@@ -539,9 +546,7 @@ async def main_handler(msg: Message) -> None:
                 enabled.remove(uid)
             users_db.setdefault("meta", {}).pop(str(uid), None)
             save_users(users_db)
-            await msg.answer(
-                f"❌ Пользователь `{uid}` удалён из списка.",                
-            )
+            await send_response(msg, f"❌ Пользователь {uid} удалён из списка.")
             return
 
         if cmd == "stats":
@@ -555,7 +560,7 @@ async def main_handler(msg: Message) -> None:
                 f"Токены: *{s['total_tokens']}*\n"
                 f"Стоимость: *{s['total_cost']:.3f}* у.е.\n"
             )
-            await msg.answer(txt)
+            await send_response(msg, txt)
             return
 
         if cmd == "stats_reset":
@@ -576,9 +581,7 @@ async def main_handler(msg: Message) -> None:
                 "total_cost": 0.0,
             }
             save_users(users_db)
-            await msg.answer(
-                f"🧹 Статистика пользователя `{uid}` сброшена.",                
-            )
+            await send_response(msg, f"🧹 Статистика пользователя {uid} сброшена.")
             return
 
         if cmd == "stats_all":
@@ -587,7 +590,7 @@ async def main_handler(msg: Message) -> None:
             stats = users_db.get("stats", {})
             meta = users_db.get("meta", {})
             if not stats:
-                await msg.answer("📊 Статистика пока пуста.", parse_mode=None)
+                await send_response(msg, "📊 Статистика пока пуста.")
                 return
             total_req = total_img = total_tok = 0
             total_mb = total_cost = 0.0
@@ -617,7 +620,7 @@ async def main_handler(msg: Message) -> None:
                 f"объём {total_mb:.2f} MB, токены {total_tok}, "
                 f"стоимость {total_cost:.3f} у.е."
             )
-            await msg.answer("\n\n".join(lines), parse_mode=None)
+            await send_response(msg, "\n\n".join(lines))
             return
 
         if cmd == "balance":
@@ -679,9 +682,9 @@ async def main_handler(msg: Message) -> None:
         # только текст
         if not images_bytes:
             if not text_after_cmd:
-                await msg.answer("Нет ни изображений, ни текста.", parse_mode=None)
+                await send_response(msg, "Нет ни изображений, ни текста.")
                 return
-            await msg.answer("💭 Думаю над текстом...", parse_mode=None)
+            await send_response(msg, "💭 Думаю над текстом...")
             resp = call_model_with_text_only(
                 cfg,
                 text_after_cmd,
@@ -704,11 +707,10 @@ async def main_handler(msg: Message) -> None:
                     total_cost = float(usage.get("total_cost", 0.0) or 0.0)
                 except (TypeError, ValueError):
                     total_cost = 0.0
-            safe_body = escape_hash(text_result)
-            final = safe_body
+            final = text_result
             if total_cost > 0:
-                final += f"\n\n*💎 {total_cost:.3f} у.е.*"
-            await send_text_or_file(msg, final, filename_prefix="text")
+                final += f"\n\n💎 {total_cost:.3f} у.е."
+            await send_response(msg, final, filename_prefix="text")
             return
 
         # есть изображения — сначала ресайз
@@ -758,10 +760,11 @@ async def main_handler(msg: Message) -> None:
         n_files = len(resized)
         files_word = "файл" if n_files == 1 else "файла" if n_files < 5 else "файлов"
 
-        await msg.answer(
+        await send_response(
+            msg,
             f"📷 Взял в работу {n_files} {files_word}. "
-            f"Размер {escape_md(fmt_mb(orig_total))} → {escape_md(fmt_mb(resized_total))}, "
-            f"промт {escape_md(prompt_label)}.",            
+            f"Размер {fmt_mb(orig_total)} → {fmt_mb(resized_total)}, "
+            f"промт {prompt_label}."
         )
 
         multiple = len(resized) > 1
@@ -815,7 +818,7 @@ async def main_handler(msg: Message) -> None:
                 except (TypeError, ValueError):
                     pass
 
-            aggregated_texts.append(escape_hash(text_result))
+            aggregated_texts.append(text_result)
         else:
             for i, jpeg in enumerate(resized, start=1):
                 if use_text_override:
@@ -851,14 +854,14 @@ async def main_handler(msg: Message) -> None:
                     except (TypeError, ValueError):
                         pass
 
-                header = f"*Изображение #{i}*\n"
-                aggregated_texts.append(header + escape_hash(text_result))
+                header = f"Изображение #{i}\n"
+                aggregated_texts.append(header + text_result)
 
         final_text = "\n\n".join(aggregated_texts)
         if total_cost_request > 0:
-            final_text += f"\n\n*💎 {total_cost_request:.3f} у.е.*"
+            final_text += f"\n\n💎 {total_cost_request:.3f} у.е."
 
-        await send_text_or_file(msg, final_text, filename_prefix="images")
+        await send_response(msg, final_text, filename_prefix="images")
 
     except Exception as e:
         await safe_error_reply(msg, e)
