@@ -39,6 +39,58 @@ Notes:
    docker compose build
    docker compose up -d
 
+### Uninstall Docker (if you prefer to run the app directly)
+
+If you decide to stop using Docker on the host and run the bot as a plain systemd service, remove Docker packages and clean up data:
+
+```bash
+sudo systemctl stop docker
+sudo apt remove --purge docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
+sudo apt autoremove -y
+# Optional: remove leftover data (volumes/images) - be careful: this deletes images/containers/volumes
+sudo rm -rf /var/lib/docker /etc/docker /var/run/docker.sock
+```
+
+Make sure you've backed up any volumes/host data you need before deleting.
+
+### Run the bot directly (systemd) — recommended when not using Docker
+
+1. Create a system user and group for running the bot (example):
+
+```bash
+sudo useradd -m --system aiimage
+```
+
+2. Clone repository and set up Python environment (recommended in the user's home):
+
+```bash
+sudo -u aiimage -H bash -c '
+  cd ~
+  git clone https://github.com/<your>/ai_image_analyzer.git
+  cd ai_image_analyzer
+  python3 -m venv venv
+  ./venv/bin/pip install -r requirements.txt
+'
+# Create and fill .env with BOT_TOKEN and other variables in repo root
+```
+
+3. Copy and enable the example systemd unit file (edit paths first):
+
+```bash
+sudo cp deploy/ai_image_analyzer.service.example /etc/systemd/system/ai_image_analyzer.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now ai_image_analyzer.service
+sudo systemctl status ai_image_analyzer.service
+```
+
+4. Logs are available via journalctl:
+
+```bash
+sudo journalctl -u ai_image_analyzer -f
+```
+
+This approach starts `bot.py` directly under a system user, uses a Python virtualenv, and relies on systemd to restart the process on failure.
+
 4. To update: pull new code, rebuild and restart:
 
    git pull
