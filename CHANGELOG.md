@@ -15,3 +15,5 @@ All notable changes to this project are documented in this file.
 ---
 
 For details see recent commits on `main`.
+\
+Note: core package `ai_image_analyzer` added with minimal config, image processing and model client placeholders; further refactor planned.
