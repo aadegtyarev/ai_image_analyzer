@@ -85,8 +85,21 @@ def set_media_context(media_group_id: str, ctx: dict) -> None:
         print(f"[MEDIA_DEBUG] set media context {media_group_id}: prompt_label={ctx.get('prompt_label')}", file=sys.stderr)
 
 
-async def _process_media_group(mgid: str, cfg) -> None:
-    """Process cached media group: build collage or per-image calls and send results."""
+async def _process_media_group(mgid: str, cfg=None) -> None:
+    """Process cached media group: build collage or per-image calls and send results.
+
+    If `cfg` is not provided, attempt to use `bot.cfg` (set by `bot.main.setup_config()`)
+    or fall back to calling `ai_image_analyzer.load_config()`.
+    """
+    if cfg is None:
+        try:
+            cfg = getattr(__import__('bot'), 'cfg', None)
+            if cfg is None:
+                from ai_image_analyzer import load_config
+
+                cfg = load_config()
+        except Exception:
+            cfg = None
     try:
         # If context is not ready, return
         ctx = get_media_context(mgid)
