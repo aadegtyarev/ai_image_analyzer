@@ -14,6 +14,11 @@ def setup_config() -> None:
     try:
         cfg = load_config()
         pkg.cfg = cfg
+        # Ensure BOT_TOKEN from .env is visible on the package for runtime checks
+        try:
+            pkg.BOT_TOKEN = __import__('os').environ.get('BOT_TOKEN')
+        except Exception:
+            pkg.BOT_TOKEN = None
         return cfg
     except Exception:
         # Do not raise here; callers (start) will handle and report errors.
@@ -22,14 +27,16 @@ def setup_config() -> None:
 
 
 async def run() -> None:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set")
-
     # Load and attach configuration for the rest of the bot modules
     setup_config()
 
+    # Read BOT_TOKEN from package/env after loading .env
+    bot_token = getattr(pkg, "BOT_TOKEN", None) or __import__("os").environ.get("BOT_TOKEN")
+    if not bot_token:
+        raise RuntimeError("BOT_TOKEN is not set")
+
     # Initialize real Bot instance and attach to package for compatibility
-    b = Bot(BOT_TOKEN)
+    b = Bot(bot_token)
     pkg.bot = b
 
     dp = Dispatcher()
