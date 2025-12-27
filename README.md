@@ -31,6 +31,9 @@ resp = handle_json_request(req)
 ```
 
 If you still need a CLI-style helper, use the thin runner or the package APIs directly — the legacy CLI lives in `legacy/` for reference.
+
+See `examples/` for small runnable examples demonstrating how to use the
+package programmatically (e.g. `examples/analyzer_service_example.py`).
 * `OPENAI_BALANCE_THRESHOLD` — опциональный числовой порог баланса (в валюте сервиса). Если включена проверка баланса (`--check-balance`) и фактический баланс меньше порога, скрипт выведет предупреждение.
 * Поля `usage` (prompt_tokens/completion_tokens/total_tokens/total_cost) возвращаются при доступности от провайдера. `total_cost` округляется до 3 знаков после запятой. В CLI выводится `USAGE:` с этой информацией после каждого анализа (если не указан `-q`).
 
