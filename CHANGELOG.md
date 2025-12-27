@@ -13,6 +13,7 @@ All notable changes to this project are documented in this file.
 - Docs: updated `BOT.md`, `README.md` and `env.example` to reflect changes above. ✅
  - Change: deprecated monolithic CLI; moved legacy `ai_image_analyzer.py` and `bot.py` into `legacy/`. Use `python bot.py` to run the Telegram bot or the `ai_image_analyzer` package API for programmatic use. ✅
  - Add: JSON API now supports `images` (base64/path), `per_image` mode and collage mode; billing aggregation via `include_billing`. ✅
+- Remove: legacy monolith scripts `legacy/ai_image_analyzer.py` and `legacy/bot.py` removed from the repository (they are preserved in backup branches: `backup/legacy-save-20251227_042014` and `backup/legacy-remove-20251227_045333`). ✅
 
 ---
 
