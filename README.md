@@ -174,6 +174,13 @@ sudo ./deploy/install-as-service.sh \
 - клонирует/обновляет репозиторий в указанной папке;
 - создаёт `venv` и устанавливает зависимости;
 - создаёт `.env` (если его нет) и сообщает, что нужно поместить туда `BOT_TOKEN` и `BOT_ADMIN_ID`;
+  - Файл конфигурации: `.env` в корне проекта. В него помещаются настройки, например:
+    ```text
+    OPENAI_API_KEY=your_api_key
+    BOT_TOKEN=your_telegram_bot_token
+    BOT_ADMIN_ID=123456789
+    ```
+    Полный список переменных см. в `env.example`.
 - ставит systemd unit `/etc/systemd/system/ai_image_analyzer.service`, включает и запускает сервис;
 - логи доступны: `sudo journalctl -u ai_image_analyzer -f`.
 
