@@ -2,72 +2,35 @@
 
 Python‑инструмент для анализа фотографий с помощью OpenAI‑совместимых vision‑моделей.
 
-Кратко:
-- одна картинка → один запрос, результат сохраняется рядом с файлом
-- несколько картинок (до 10) → ресайз → коллаж → один запрос
-- режим `--per-image` — отдельный запрос и файл на каждую картинку
-- текстовая надстройка (`-t`) и чисто текстовые запросы
-- конфигурация через `.env` с переопределением параметров через CLI
-- может работать как CLI и как модуль (JSON‑API/бот)
+## 🖼 Running the bot and programmatic API
 
----
+The old monolithic CLI (`python ai_image_analyzer.py`) has been deprecated and moved to `legacy/`.
 
-## ⚙ Установка
-
-Требуется **Python 3.10+**.
-
-Клонируем репозиторий и устанавливаем зависимости:
+To run the Telegram bot locally use the thin runner:
 
 ```bash
-git clone <ваш_репозиторий>
-cd <папка_проекта>
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+python bot.py
 ```
 
-Содержимое `requirements.txt` (основное):
+For programmatic usage prefer the library API:
 
-```text
-openai>=1.54.0
-Pillow>=11.0.0
-python-dotenv>=1.0.1
-aiogram>=3.0.0
-requests>=2.0.0
+```python
+from ai_image_analyzer import handle_json_request
+
+# Example: analyze two images as a collage
+req = {
+  "action": "analyze",
+  "images": [
+    {"name": "a.jpg", "data_b64": "..."},
+    {"name": "b.jpg", "data_b64": "..."},
+  ],
+  "per_image": False,
+  "include_billing": True,
+}
+resp = handle_json_request(req)
 ```
 
----
-
-## 🧩 Настройка `.env`
-
-Создайте `.env` рядом с `bot.py` (или используйте существующий). Простой способ:
-
-```bash
-cp .env.example .env
-Пример переменных (убедитесь, что задали `BOT_TOKEN` и `BOT_ADMIN_ID`):
-BOT_TOKEN=your_tg_bot_token
-BOT_ADMIN_ID=123456789
-
-OPENAI_API_KEY=your_openai_key
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=gpt-4o-mini
-
-### Environment variables
-
-You can control admin notifications for edit failures using `NOTIFY_ON_EDIT_FAILURE` (default: disabled).
-
-- `NOTIFY_ON_EDIT_FAILURE=1` — send admin a short notification when the bot fails to edit a kickoff message and falls back to sending a new message.
-- `NOTIFY_ON_EDIT_FAILURE=0` — (default) do not send admin notifications on edit failures.
-IMAGE_MAX_SIZE=1024
-IMAGE_QUALITY=85
-PROMPT_FILE=prompts/art_analysis.txt
-```
-
-* `OPENAI_BASE_URL` — можно указывать прокси/совместимые сервисы.
-* Все параметры `.env` можно **переопределить из CLI** одноимёнными флагами:
-  * `--OPENAI_MODEL`, `--OPENAI_TIMEOUT`, `--IMAGE_MAX_SIZE` и т.д.
-
-* `OPENAI_MAX_TOKENS` отвечает за максимальное число токенов, которое модель может сгенерировать (параметр `max_tokens`).
+If you still need a CLI-style helper, use the thin runner or the package APIs directly — the legacy CLI lives in `legacy/` for reference.
 * `OPENAI_BALANCE_THRESHOLD` — опциональный числовой порог баланса (в валюте сервиса). Если включена проверка баланса (`--check-balance`) и фактический баланс меньше порога, скрипт выведет предупреждение.
 * Поля `usage` (prompt_tokens/completion_tokens/total_tokens/total_cost) возвращаются при доступности от провайдера. `total_cost` округляется до 3 знаков после запятой. В CLI выводится `USAGE:` с этой информацией после каждого анализа (если не указан `-q`).
 

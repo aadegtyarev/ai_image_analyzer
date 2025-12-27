@@ -11,6 +11,8 @@ All notable changes to this project are documented in this file.
 - Change: unified debug flags — use `DEBUG=1` (general) and `IMAGE_DEBUG=1` (image details). ✅
 - Add: unit tests for media-group caching and logging; updated/simplified tests around prompts and debug. ✅
 - Docs: updated `BOT.md`, `README.md` and `env.example` to reflect changes above. ✅
+ - Change: deprecated monolithic CLI; moved legacy `ai_image_analyzer.py` and `bot.py` into `legacy/`. Use `python bot.py` to run the Telegram bot or the `ai_image_analyzer` package API for programmatic use. ✅
+ - Add: JSON API now supports `images` (base64/path), `per_image` mode and collage mode; billing aggregation via `include_billing`. ✅
 
 ---
 
