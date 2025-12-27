@@ -7,159 +7,23 @@ import json
 import traceback
 from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Optional
-from uuid import uuid4
+"""Thin shim that re-exports the new `bot` package and provides a CLI entrypoint.
 
-from dotenv import load_dotenv
+This file exists for compatibility with scripts or users that run
+`python bot.py`. It intentionally keeps logic minimal and delegates to
+`bot.main` for running the polling loop.
+"""
 
-from aiogram import Bot, Dispatcher, Router
-from aiogram.types import Message, FSInputFile, BotCommand
-from aiogram.enums import ChatType
-from aiogram.client.default import DefaultBotProperties
+from bot import *  # re-export package symbols for compatibility
 
-from ai_image_analyzer import (
-    load_config,
-    call_model_with_image,
-    call_model_with_text_only,
-    build_collage_system_prompt,
-    read_prompt_file,
-    make_collage,
-    check_balance,
-)
-from typing import Dict
-import socket
 
-load_dotenv()
-
-# --- ENV / paths ---
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-def _int_from_env(name: str, default: int = 0) -> int:
-    val = os.getenv(name, "")
-    if val is None:
-        return default
-    # strip inline comments and whitespace
+if __name__ == "__main__":
+    # Run the bot using the new `bot.main` runner
     try:
-        val = val.split("#", 1)[0].strip()
-        return int(val) if val != "" else default
-    except Exception:
-        return default
-
-
-BOT_ADMIN_ID = _int_from_env("BOT_ADMIN_ID", 0)
-BOT_ADMIN_USERNAME = os.getenv("BOT_ADMIN_USERNAME")
-
-PROMPTS_DIR = os.getenv("PROMPTS_DIR", "prompts")
-HOWTO_DIR = os.getenv("HOWTO_DIR", "howto")
-USERS_FILE = os.getenv("USERS_FILE", "db/users.json")
-
-PER_IMAGE_DEFAULT = os.getenv("PER_IMAGE_DEFAULT", "true").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set in environment/.env")
-
-# --- aiogram wiring ---
-
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
-router = Router()
-dp.include_router(router)
-
-# --- users db & stats ---
-
-def _ensure_users_file_dir() -> None:
-    d = os.path.dirname(USERS_FILE)
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
-
-
-def load_users() -> Dict[str, Any]:
-    _ensure_users_file_dir()
-    if not os.path.exists(USERS_FILE):
-        data = {"enabled": [], "stats": {}, "meta": {}}
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return data
-    with open(USERS_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    data.setdefault("enabled", [])
-    data.setdefault("stats", {})
-    data.setdefault("meta", {})
-    return data
-
-
-def save_users(data: Dict[str, Any]) -> None:
-    _ensure_users_file_dir()
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-users_db: Dict[str, Any] = load_users()
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id == BOT_ADMIN_ID
-
-
-def is_allowed(user_id: int) -> bool:
-    if is_admin(user_id):
-        return True
-    return user_id in users_db.get("enabled", [])
-
-
-def ensure_stats(uid: int) -> None:
-    stats = users_db.setdefault("stats", {})
-    key = str(uid)
-    if key not in stats:
-        stats[key] = {
-            "requests": 0,
-            "images": 0,
-            "megabytes": 0.0,
-            "total_tokens": 0,
-            "total_cost": 0.0,
-        }
-
-
-def update_stats_after_call(
-    uid: int,
-    images: int,
-    bytes_sent: int,
-    usage: Optional[dict],
-) -> None:
-    ensure_stats(uid)
-    s = users_db["stats"][str(uid)]
-    s["requests"] += 1
-    s["images"] += images
-    s["megabytes"] += bytes_sent / (1024.0 * 1024.0)
-    if usage:
-        s["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
-        try:
-            s["total_cost"] += float(usage.get("total_cost", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            pass
-    save_users(users_db)
-
-
-def set_user_meta(uid: int, description: str, username: str = "", full_name: str = ""):
-    meta = users_db.setdefault("meta", {})
-    meta[str(uid)] = {
-        "description": description,
-        "username": username,
-        "full_name": full_name,
-    }
-    save_users(users_db)
-
-
-
-# --- Markdown → HTML для Telegram ---
-import re
-FORMAT_MODE = 'HTML'  # 'HTML' для теста, None — plain text
-
-def simple_markdown_to_html(md: str) -> str:
+        from bot.main import start
+        start()
+    except Exception as e:
+        print(f"Failed to start bot: {e}")
     def esc(s):
         return (
             s.replace("&", "&amp;")

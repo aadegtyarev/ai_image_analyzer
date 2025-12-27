@@ -55,16 +55,38 @@ class OpenAIProvider:
                     return "\n".join([p for p in parts if p])
             raise RuntimeError("OpenAIProvider.call_text: unexpected SDK response shape")
 
-        # Fallback: no SDK client available
+        # Fallback: if base_url is configured, call HTTP responses endpoint
+        if getattr(cfg, "base_url", None):
+            import requests
+
+            url = cfg.base_url.rstrip("/") + "/responses"
+            headers = {"Authorization": f"Bearer {cfg.api_key}"}
+            payload = {"input": (system_prompt or "") + "\n" + text}
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=getattr(cfg, "timeout", 30))
+                resp.raise_for_status()
+                data = resp.json()
+                # Expect {'text': '...', 'usage': {...}}
+                return data.get("text") if data is not None else None
+            except Exception as e:  # pragma: no cover - network failure paths
+                raise RuntimeError(f"OpenAIProvider.call_text HTTP fallback failed: {e}") from e
+
         raise RuntimeError("OpenAIProvider.call_text not implemented; provide client or mock in tests")
 
     def call_image(self, cfg: Any, jpeg_bytes: bytes, system_prompt: Optional[str] = None, user_text: Optional[str] = None, quiet: bool = False, image_meta: Optional[dict] = None) -> Any:
-        # Try SDK client path first
-        client = None
-        try:
-            client = self._build_client(cfg)
-        except Exception:
-            client = self._client
+        # Prefer explicit injected client; otherwise prefer HTTP when base_url is set.
+        client = self._client
+
+        if client is None and getattr(cfg, "base_url", None):
+            # Use HTTP fallback (below)
+            client = None
+
+        # If no base_url or an explicit client was provided, try SDK client
+        if client is None and not getattr(cfg, "base_url", None):
+            try:
+                client = self._build_client(cfg)
+            except Exception:
+                client = None
 
         if client is not None and hasattr(client, "responses") and callable(getattr(client.responses, "create", None)):
             # Build SDK-compatible input: many SDKs accept structured inputs
@@ -91,18 +113,20 @@ class OpenAIProvider:
         # Fallback to HTTP multipart POST to cfg.base_url + '/images'
         if getattr(cfg, "base_url", None):
             import requests
-
-            url = cfg.base_url.rstrip("/") + "/images"
-            headers = {"Authorization": f"Bearer {cfg.api_key}"}
-            files = {"image": ("image.jpg", jpeg_bytes, "image/jpeg")}
-            data = {"prompt": system_prompt or ""}
-            resp = requests.post(url, headers=headers, files=files, data=data, timeout=getattr(cfg, "timeout", 30))
-            resp.raise_for_status()
-            data = resp.json()
-            # Expecting {'text': '...', 'usage': {...}} from the service
-            text = data.get("text")
-            usage = data.get("usage")
-            return text, usage
+            try:
+                url = cfg.base_url.rstrip("/") + "/images"
+                headers = {"Authorization": f"Bearer {cfg.api_key}"}
+                files = {"image": ("image.jpg", jpeg_bytes, "image/jpeg")}
+                data = {"prompt": system_prompt or ""}
+                resp = requests.post(url, headers=headers, files=files, data=data, timeout=getattr(cfg, "timeout", 30))
+                resp.raise_for_status()
+                data = resp.json()
+                # Expecting {'text': '...', 'usage': {...}} from the service
+                text = data.get("text")
+                usage = data.get("usage")
+                return text, usage
+            except Exception as e:  # pragma: no cover - network failure
+                raise RuntimeError(f"OpenAIProvider.call_image HTTP fallback failed: {e}") from e
 
         raise RuntimeError("OpenAIProvider.call_image not available: no SDK client and no base_url configured")
 

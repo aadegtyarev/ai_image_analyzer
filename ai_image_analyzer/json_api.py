@@ -3,12 +3,13 @@ import os
 import base64
 from .image_io import resize_image_from_bytes, load_and_resize_image, make_collage_wrapper
 from .image_processing import build_collage_system_prompt
-from .config import read_prompt_file
+from .config import read_prompt_file, load_config
 
 
 def handle_json_request(req: dict) -> dict:
-    # If there's no override_text, ensure API key exists
-    if req.get("override_text") is None and not os.environ.get("OPENAI_API_KEY"):
+    # If there's no override_text and no images (or empty images), ensure API key exists
+    imgs = req.get("images")
+    if req.get("override_text") is None and (imgs is None or (isinstance(imgs, list) and len(imgs) == 0)) and not os.environ.get("OPENAI_API_KEY"):
         return {"ok": False, "errors": ["OPENAI_API_KEY is not set"]}
 
     action = req.get("action")
@@ -21,7 +22,7 @@ def handle_json_request(req: dict) -> dict:
     if override_text is not None:
         try:
             # Import from package so tests can monkeypatch call_model_with_text_only
-            from ai_image_analyzer import call_model_with_text_only, load_config
+            from ai_image_analyzer import call_model_with_text_only
 
             result = call_model_with_text_only(load_config(), override_text, system_prompt="", quiet=True)
         except Exception as e:
@@ -49,7 +50,8 @@ def handle_json_request(req: dict) -> dict:
             name = itm.get("name") or f"image_{idx}.jpg"
             if itm.get("data_b64") is not None:
                 try:
-                    b = base64.b64decode(itm.get("data_b64"))
+                    # validate=True ensures invalid base64 raises an exception
+                    b = base64.b64decode(itm.get("data_b64"), validate=True)
                 except Exception as e:
                     return {"ok": False, "errors": [f"invalid base64 for image {name}: {e}"]}
                 try:

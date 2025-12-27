@@ -1,203 +1,40 @@
 #!/usr/bin/env python3
-"""
-ai_image_analyzer
+"""Thin CLI wrapper for the `ai_image_analyzer` package.
 
-Скрипт для анализа одиночных изображений или коллажей
-через совместимую с OpenAI API модель (в т.ч. vsegpt).
-
-Поддержка:
-- .env конфиг (OPENAI_*, IMAGE_*, PROMPT_FILE, COLLAGE_*).
-- Переопределение этих параметров через CLI.
-- Режимы:
-  * одна картинка → один запрос, результат в *_analyse.md;
-  * несколько картинок (до 10) → коллаж, один запрос, group_..._analyse.md;
-  * override-текст (-t/--text) вместо системного промта → печать только в stdout;
-  * текст без картинок → текстовый запрос к модели, результат в stdout.
-- Логи и статистика по usage (токены, стоимость).
-- Запрос баланса провайдера (--check-balance).
+This script provides a small backward-compatible command line entrypoint
+and delegates work to the `ai_image_analyzer` package modules.
 """
 
 import argparse
-import base64
-import glob
-import io
-import json
-import math
-import os
 import sys
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, List, Optional, Sequence, Tuple
-
-import requests
-from PIL import Image, ImageOps  # pillow
-try:
-    from dotenv import load_dotenv  # type: ignore
-except ImportError:  # dotenv is optional
-    def load_dotenv(*args, **kwargs):
-        return False
-
-try:
-    from openai import OpenAI, BadRequestError
-except ImportError:
-    OpenAI = None  # type: ignore
-
-    class BadRequestError(Exception):
-        pass
+from ai_image_analyzer import load_config, call_model_with_text_only
 
 
-# ---------------------------------------------------------------------------
-# Конфиг
-# ---------------------------------------------------------------------------
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="ai_image_analyzer CLI (thin wrapper)")
+    parser.add_argument("images", nargs="*", help="Image files to analyze")
+    parser.add_argument("-t", "--text", dest="text", help="Text override / text-only request")
+    args = parser.parse_args(argv)
+
+    if args.text:
+        cfg = load_config()
+        res = call_model_with_text_only(cfg, args.text, system_prompt="", quiet=False)
+        if isinstance(res, tuple):
+            print(res[0])
+        else:
+            print(res)
+        return 0
+
+    if args.images:
+        print("Image analysis via CLI is deprecated; please use the library API or the bot.")
+        return 0
+
+    parser.print_help()
+    return 0
 
 
-@dataclass
-class Config:
-    api_key: str
-    base_url: Optional[str]
-    model: str
-    timeout: int
-    max_tokens: int
-    image_max_size: int
-    image_quality: int
-    collage_max_size: int
-    collage_quality: int
-    prompt_file: Optional[str]
-    image_debug: bool = False
-
-
-def load_config() -> Config:
-    load_dotenv()
-
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        sys.exit("ERROR: OPENAI_API_KEY is not set")
-
-    base_url = os.environ.get("OPENAI_BASE_URL") or None
-    model = os.environ.get("OPENAI_MODEL") or "gpt-4.1-mini"
-
-    def _int_env(name: str, default: int) -> int:
-        v = os.environ.get(name)
-        if not v:
-            return default
-        try:
-            return int(v)
-        except ValueError:
-            print(f"WARNING: invalid {name}={v!r}, using default {default}", file=sys.stderr)
-            return default
-
-    timeout = _int_env("OPENAI_TIMEOUT", 120)
-    max_tokens = _int_env("OPENAI_MAX_TOKENS", 1024)
-    image_max_size = _int_env("IMAGE_MAX_SIZE", 1024)
-    image_quality = _int_env("IMAGE_QUALITY", 90)
-    collage_max_size = _int_env("COLLAGE_MAX_SIZE", 2048)
-    collage_quality = _int_env("COLLAGE_QUALITY", 90)
-
-    prompt_file = os.environ.get("PROMPT_FILE")
-    # Unified debug flag: check DEBUG first, fall back to IMAGE_DEBUG for backward compatibility
-    image_debug_env = os.environ.get("DEBUG", None)
-    if image_debug_env is None:
-        image_debug_env = os.environ.get("IMAGE_DEBUG", "")
-    image_debug = str(image_debug_env).lower() in ("1", "true", "yes")
-
-    return Config(
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-        timeout=timeout,
-        max_tokens=max_tokens,
-        image_max_size=image_max_size,
-        image_quality=image_quality,
-        collage_max_size=collage_max_size,
-        collage_quality=collage_quality,
-        prompt_file=prompt_file,
-        image_debug=image_debug,
-    )
-
-
-def read_prompt_file(path: Optional[str]) -> str:
-    # Non-fatal: if no path is provided or the file cannot be read, return an
-    # empty string and log a warning instead of exiting the process. The bot
-    # will handle an empty system prompt gracefully.
-    if not path:
-        return ""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except OSError as e:
-        print(f"ERROR: failed to read PROMPT_FILE={path!r}: {e}", file=sys.stderr)
-        return ""
-
-
-def load_config_from_env(env: dict):
-    """Backward-compatible loader used by tests.
-
-    Returns a simple object with attributes `context_size`, `max_tokens`, and `x_title`.
-    """
-    class SimpleCfg:
-        pass
-
-    cfg = SimpleCfg()
-    try:
-        context_size = int(env.get("OPENAI_CONTEXT_SIZE", 2048))
-    except Exception:
-        context_size = 2048
-    try:
-        max_tokens = int(env.get("OPENAI_MAX_TOKENS", 1024))
-    except Exception:
-        max_tokens = 1024
-    # cap max_tokens to context_size - 1
-    if max_tokens > max(0, context_size - 1):
-        max_tokens = max(0, context_size - 1)
-    cfg.context_size = context_size
-    cfg.max_tokens = max_tokens
-    cfg.x_title = env.get("OPENAI_X_TITLE")
-    return cfg
-
-
-def handle_json_request(req: dict) -> dict:
-    """Minimal JSON API handler for tests and integrations.
-
-    Supports action 'analyze' with optional 'override_text' and 'include_billing'.
-    """
-    # basic validation: if there's no override_text we need an API key
-    if req.get("override_text") is None and not os.environ.get("OPENAI_API_KEY"):
-        return {"ok": False, "errors": ["OPENAI_API_KEY is not set"]}
-
-    action = req.get("action")
-    if action != "analyze":
-        return {"ok": False, "errors": ["unsupported action"]}
-
-    override_text = req.get("override_text")
-    include_billing = bool(req.get("include_billing", False))
-
-    if override_text is not None:
-        # call text-only path
-        try:
-            result, usage = call_model_with_text_only(load_config(), override_text, system_prompt="", quiet=True)
-        except Exception as e:
-            return {"ok": False, "errors": [str(e)]}
-        resp = {"ok": True, "results": result}
-        if include_billing:
-            resp["usage"] = usage
-        return resp
-
-    # For now, other modes are not implemented in tests
-    return {"ok": False, "errors": ["no override_text provided"]}
-
-
-# ---------------------------------------------------------------------------
-# Утилиты
-# ---------------------------------------------------------------------------
-
-
-def log(msg: str, quiet: bool) -> None:
-    """Простой префиксованный лог."""
-    if not quiet:
-        print(f"[ai_image_analyzer] {msg}", file=sys.stderr)
-
-
-def expand_image_patterns(patterns: Sequence[str]) -> List[str]:
+if __name__ == "__main__":
+    sys.exit(main())
     """Разворачивает маски (glob)."""
     result: List[str] = []
     for p in patterns:
