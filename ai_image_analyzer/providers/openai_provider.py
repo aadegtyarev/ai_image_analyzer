@@ -34,14 +34,77 @@ class OpenAIProvider:
         return OpenAI(**kwargs)
 
     def call_text(self, cfg: Any, text: str, system_prompt: Optional[str] = None, quiet: bool = False) -> Any:
-        # Simple wrapper: tests should mock _build_client and behaviour
-        client = self._build_client(cfg)
-        # This is intentionally abstract: real implementation depends on provider API
-        raise RuntimeError("OpenAIProvider.call_text not implemented; mock in tests")
+        # Basic implementation: try to use injected SDK client if available.
+        client = None
+        try:
+            client = self._build_client(cfg)
+        except Exception:
+            client = self._client
+
+        if client is not None and hasattr(client, "responses") and callable(getattr(client.responses, "create", None)):
+            # SDK-like path
+            resp = client.responses.create(model=getattr(cfg, "model", "gpt-4"), input=(system_prompt or "") + "\n" + text)
+            # resp may be dict-like or have .to_dict()
+            if hasattr(resp, "to_dict"):
+                resp = resp.to_dict()
+            if isinstance(resp, dict):
+                if "text" in resp:
+                    return resp["text"]
+                if "output" in resp and isinstance(resp["output"], list):
+                    parts = [p.get("content") or p.get("text") for p in resp["output"] if isinstance(p, dict)]
+                    return "\n".join([p for p in parts if p])
+            raise RuntimeError("OpenAIProvider.call_text: unexpected SDK response shape")
+
+        # Fallback: no SDK client available
+        raise RuntimeError("OpenAIProvider.call_text not implemented; provide client or mock in tests")
 
     def call_image(self, cfg: Any, jpeg_bytes: bytes, system_prompt: Optional[str] = None, user_text: Optional[str] = None, quiet: bool = False, image_meta: Optional[dict] = None) -> Any:
-        client = self._build_client(cfg)
-        raise RuntimeError("OpenAIProvider.call_image not implemented; mock in tests")
+        # Try SDK client path first
+        client = None
+        try:
+            client = self._build_client(cfg)
+        except Exception:
+            client = self._client
+
+        if client is not None and hasattr(client, "responses") and callable(getattr(client.responses, "create", None)):
+            # Build SDK-compatible input: many SDKs accept structured inputs
+            inp = []
+            if system_prompt:
+                inp.append({"role": "system", "content": system_prompt})
+            if user_text:
+                inp.append({"role": "user", "content": user_text})
+            # For images, include raw bytes in a known key (tests will supply compatible client)
+            inp.append({"image": jpeg_bytes})
+            resp = client.responses.create(model=getattr(cfg, "model", "gpt-image-1"), input=inp)
+            if hasattr(resp, "to_dict"):
+                resp = resp.to_dict()
+            # Parse SDK-like response shapes
+            if isinstance(resp, dict):
+                # Common: {'text': '...', 'usage': {...}}
+                if "text" in resp:
+                    return resp["text"], resp.get("usage")
+                if "output" in resp and isinstance(resp["output"], list):
+                    parts = [p.get("content") or p.get("text") for p in resp["output"] if isinstance(p, dict)]
+                    return "\n".join([p for p in parts if p]), resp.get("usage")
+            raise RuntimeError("OpenAIProvider.call_image: unexpected SDK response shape")
+
+        # Fallback to HTTP multipart POST to cfg.base_url + '/images'
+        if getattr(cfg, "base_url", None):
+            import requests
+
+            url = cfg.base_url.rstrip("/") + "/images"
+            headers = {"Authorization": f"Bearer {cfg.api_key}"}
+            files = {"image": ("image.jpg", jpeg_bytes, "image/jpeg")}
+            data = {"prompt": system_prompt or ""}
+            resp = requests.post(url, headers=headers, files=files, data=data, timeout=getattr(cfg, "timeout", 30))
+            resp.raise_for_status()
+            data = resp.json()
+            # Expecting {'text': '...', 'usage': {...}} from the service
+            text = data.get("text")
+            usage = data.get("usage")
+            return text, usage
+
+        raise RuntimeError("OpenAIProvider.call_image not available: no SDK client and no base_url configured")
 
     def check_balance(self, cfg: Any, quiet: bool = False) -> dict:
         # If the SDK exposes a balance endpoint, clients can implement it;
