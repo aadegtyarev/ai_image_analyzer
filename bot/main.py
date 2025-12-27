@@ -19,6 +19,25 @@ def setup_config() -> None:
             pkg.BOT_TOKEN = __import__('os').environ.get('BOT_TOKEN')
         except Exception:
             pkg.BOT_TOKEN = None
+        # If BOT_TOKEN wasn't set via load_dotenv (malformed .env lines), try a tolerant parse of the .env file
+        if not pkg.BOT_TOKEN:
+            try:
+                from ai_image_analyzer.config import find_dotenv
+                import re
+
+                env_path = find_dotenv() or ".env"
+                try:
+                    with open(env_path, "r", encoding="utf-8", errors="ignore") as f:
+                        data = f.read()
+                        m = re.search(r"\bBOT_TOKEN\s*=\s*([\w:\-\.]+)", data)
+                        if m:
+                            t = m.group(1).strip()
+                            __import__("os").environ["BOT_TOKEN"] = t
+                            pkg.BOT_TOKEN = t
+                except Exception:
+                    pass
+            except Exception:
+                pass
         return cfg
     except Exception:
         # Do not raise here; callers (start) will handle and report errors.
