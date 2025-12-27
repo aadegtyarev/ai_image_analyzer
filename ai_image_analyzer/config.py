@@ -28,7 +28,34 @@ class Settings:
 
 
 def load_config() -> Settings:
-    _env = find_dotenv() or ".env"
+    # Try find_dotenv(); if it fails to locate a file, search parent directories
+    _env = find_dotenv()
+    if not _env:
+        # Walk up from current working directory to look for .env
+        p = os.path.abspath(os.getcwd())
+        found = None
+        while True:
+            cand = os.path.join(p, ".env")
+            if os.path.exists(cand):
+                found = cand
+                break
+            parent = os.path.dirname(p)
+            if parent == p:
+                break
+            p = parent
+        if not found:
+            # Also try relative to this package file (handles being imported from subfolders)
+            p = os.path.abspath(os.path.dirname(__file__))
+            while True:
+                cand = os.path.join(p, ".env")
+                if os.path.exists(cand):
+                    found = cand
+                    break
+                parent = os.path.dirname(p)
+                if parent == p:
+                    break
+                p = parent
+        _env = found or ".env"
     load_dotenv(_env)
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
